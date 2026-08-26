@@ -1,3000 +1,398 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[ ]:
-
-
-get_ipython().run_line_magic('pylab', 'inline')
-
-
-# In[ ]:
-
-
-import dataiku
-from dataiku import pandasutils as pdu
-import pandas as pd
-
-
-# In[ ]:
-
-
-# Example: load a DSS dataset as a Pandas dataframe
-mydataset = dataiku.Dataset("mydataset")
-mydataset_df = mydataset.get_dataframe()
-
-
-# In[8]:
-
-
-###############################################################################
-# ARIS v1 - Automated Request & Impact Scoping
-#
-# Phase 1: Knowledge Builder
-#
-# Purpose:
-#   Study a Dataiku project automatically and generate:
-#
-#   1. Project Summary
-#   2. Dataset Catalog
-#   3. Recipe Inventory
-#   4. Lineage Relationships
-#   5. SME Documentation
-#
-# Designed for:
-#   Any Dataiku Project
-#
-###############################################################################
+# -*- coding: utf-8 -*-
 
 import dataiku
 import json
-from collections import Counter
+from datetime import datetime
 
-###############################################################################
-# STEP 1 - CONNECT TO CURRENT DATAIKU PROJECT
-###############################################################################
+# ==========================================================================
+# CONFIG
+# ==========================================================================
+
+PROJECT_KEY = dataiku.default_project_key()
+
+# ==========================================================================
+# INIT
+# ==========================================================================
 
 client = dataiku.api_client()
-project = client.get_default_project()
+project = client.get_project(PROJECT_KEY)
 
-print(f"\nStudying Project: {project.project_key}")
+print("=" * 80)
+print("ARIS PROJECT SCANNER")
+print("=" * 80)
+print("Project:", PROJECT_KEY)
 
-###############################################################################
-# STEP 2 - EXTRACT PROJECT ASSETS
-###############################################################################
+# ==========================================================================
+# FIND ARIS MANAGED FOLDER
+# ==========================================================================
 
-datasets = project.list_datasets()
+managed_folders = project.list_managed_folders()
+
+folder_id = None
+folder_name = None
+
+for folder in managed_folders:
+
+    if folder["name"].upper() == "ARIS_CONTEXT":
+
+        folder_id = folder["id"]
+        folder_name = folder["name"]
+        break
+
+if folder_id is None:
+
+    raise Exception(
+        "Managed Folder 'ARIS_CONTEXT' not found.\n"
+        "Please create a Managed Folder named ARIS_CONTEXT."
+    )
+
+Context_files = dataiku.Folder(folder_id)
+
+print("Managed Folder:", folder_name)
+print("Folder ID:", folder_id)
+
+# ==========================================================================
+# HELPER
+# ==========================================================================
+
+def save_json(filename, data):
+
+    with Context_files.get_writer(filename) as writer:
+
+        writer.write(
+            json.dumps(
+                data,
+                indent=2,
+                default=str
+            ).encode("utf-8")
+        )
+
+    print("Saved:", filename)
+
+# ==========================================================================
+# OUTPUT STRUCTURES
+# ==========================================================================
+
+project_scan = {
+    "project": PROJECT_KEY,
+    "scan_timestamp": str(datetime.now()),
+    "recipes": [],
+    "datasets": [],
+    "edges": []
+}
+
+recipe_intelligence = []
+
+dataset_registry = {}
+
+# ==========================================================================
+# RECIPES
+# ==========================================================================
+
 recipes = project.list_recipes()
 
-aris_context = {
-    "project": project.project_key,
-    "dataset_count": len(datasets),
-    "recipe_count": len(recipes),
-    "datasets": [],
-    "recipes": [],
-    "lineage_edges": []
-}
+print("\n" + "=" * 80)
+print("SCANNING RECIPES")
+print("=" * 80)
 
-###############################################################################
-# STEP 3 - EXTRACT DATASET INFORMATION
-###############################################################################
+for recipe_info in recipes:
 
-print("\nExtracting datasets...")
+    recipe_name = recipe_info["name"]
+    recipe_type = recipe_info.get("type")
 
-for ds in datasets:
+    print("Scanning Recipe:", recipe_name)
 
     try:
 
-        dataset = project.get_dataset(ds["name"])
-        settings = dataset.get_settings()
-
-        raw = settings.get_raw()
-
-        dataset_info = {
-            "name": ds["name"],
-            "dataset_type": raw.get("type"),
-            "connection": raw.get("params", {}).get("connection"),
-            "schema": raw.get("params", {}).get("schema"),
-            "table": raw.get("params", {}).get("table"),
-            "column_count": len(
-                raw.get("schema", {}).get("columns", [])
-            ),
-            "columns": [
-                col["name"]
-                for col in raw.get("schema", {}).get("columns", [])
-            ]
-        }
-
-        aris_context["datasets"].append(dataset_info)
+        recipe_obj = project.get_recipe(recipe_name)
+        settings = recipe_obj.get_settings()
 
     except Exception as e:
 
-        aris_context["datasets"].append({
-            "name": ds["name"],
-            "error": str(e)
-        })
+        print("Failed:", recipe_name, str(e))
+        continue
 
-###############################################################################
-# STEP 4 - EXTRACT RECIPE DETAILS
-###############################################################################
+    # ----------------------------------------------------------
+    # INPUTS
+    # ----------------------------------------------------------
 
-print("Extracting recipes...")
+    try:
+        inputs = settings.get_recipe_inputs()
+    except:
+        inputs = {}
 
-for r in recipes:
+    # ----------------------------------------------------------
+    # OUTPUTS
+    # ----------------------------------------------------------
+
+    try:
+        outputs = settings.get_recipe_outputs()
+    except:
+        outputs = {}
+
+    # ----------------------------------------------------------
+    # FLOW GRAPH
+    # ----------------------------------------------------------
+
+    project_scan["recipes"].append({
+        "name": recipe_name,
+        "type": recipe_type
+    })
 
     try:
 
-        recipe = project.get_recipe(r["name"])
-        settings = recipe.get_settings()
+        for role, vals in inputs.items():
 
-        recipe_inputs = settings.get_recipe_inputs()
-        recipe_outputs = settings.get_recipe_outputs()
+            for item in vals:
 
-        inputs = []
-        outputs = []
+                ds = item.get("ref")
 
-        #######################################################################
-        # INPUT DATASETS
-        #######################################################################
+                if ds:
 
-        for role in recipe_inputs.values():
+                    project_scan["edges"].append({
+                        "source": ds,
+                        "target": recipe_name,
+                        "relationship": "INPUT"
+                    })
 
-            for item in role.get("items", []):
+    except:
+        pass
 
-                inputs.append(item["ref"])
+    try:
 
-        #######################################################################
-        # OUTPUT DATASETS
-        #######################################################################
+        for role, vals in outputs.items():
 
-        for role in recipe_outputs.values():
+            for item in vals:
 
-            for item in role.get("items", []):
+                ds = item.get("ref")
 
-                outputs.append(item["ref"])
+                if ds:
 
-        recipe_info = {
-            "name": r["name"],
-            "type": r["type"],
-            "inputs": inputs,
-            "outputs": outputs
+                    project_scan["edges"].append({
+                        "source": recipe_name,
+                        "target": ds,
+                        "relationship": "OUTPUT"
+                    })
+
+    except:
+        pass
+
+    # ----------------------------------------------------------
+    # RAW DEFINITION
+    # ----------------------------------------------------------
+
+    try:
+        raw_definition = settings.get_recipe_raw_definition()
+    except:
+        raw_definition = {}
+
+    # ----------------------------------------------------------
+    # PARAMETERS
+    # ----------------------------------------------------------
+
+    try:
+        params = settings.get_recipe_params()
+    except:
+        params = {}
+
+    # ----------------------------------------------------------
+    # PAYLOAD
+    # ----------------------------------------------------------
+
+    try:
+        payload = settings.get_payload()
+    except:
+        payload = None
+
+    # ----------------------------------------------------------
+    # JSON PAYLOAD
+    # ----------------------------------------------------------
+
+    try:
+        json_payload = settings.get_json_payload()
+    except:
+        json_payload = None
+
+    # ----------------------------------------------------------
+    # GENERATED SQL
+    # ----------------------------------------------------------
+
+    generated_sql = None
+
+    try:
+
+        status = recipe_obj.get_status()
+
+        if hasattr(status, "data"):
+
+            if isinstance(status.data, dict):
+
+                generated_sql = status.data.get("sql")
+
+    except:
+        pass
+
+    # ----------------------------------------------------------
+    # JOINS
+    # ----------------------------------------------------------
+
+    joins = []
+
+    if hasattr(settings, "raw_joins"):
+
+        try:
+            joins = settings.raw_joins
+        except:
+            pass
+
+    # ----------------------------------------------------------
+    # CODE
+    # ----------------------------------------------------------
+
+    recipe_code = None
+
+    if hasattr(settings, "get_code"):
+
+        try:
+            recipe_code = settings.get_code()
+        except:
+            pass
+
+    # ----------------------------------------------------------
+    # STORE
+    # ----------------------------------------------------------
+
+    recipe_intelligence.append({
+
+        "recipe_name": recipe_name,
+        "recipe_type": recipe_type,
+        "settings_class": type(settings).__name__,
+
+        "inputs": inputs,
+        "outputs": outputs,
+
+        "joins": joins,
+
+        "params": params,
+
+        "generated_sql": generated_sql,
+
+        "raw_definition": raw_definition,
+
+        "payload": payload,
+
+        "json_payload": json_payload,
+
+        "code": recipe_code
+
+    })
+
+# ==========================================================================
+# DATASETS
+# ==========================================================================
+
+print("\n" + "=" * 80)
+print("SCANNING DATASETS")
+print("=" * 80)
+
+for dataset_info in project.list_datasets():
+
+    dataset_name = dataset_info["name"]
+
+    print("Dataset:", dataset_name)
+
+    try:
+
+        dataset = project.get_dataset(dataset_name)
+
+        try:
+            schema = dataset.get_schema()
+        except:
+            schema = {}
+
+        try:
+            settings = dataset.get_settings().get_raw()
+        except:
+            settings = {}
+
+        dataset_registry[dataset_name] = {
+            "schema": schema,
+            "settings": settings
         }
 
-        aris_context["recipes"].append(recipe_info)
-
-        #######################################################################
-        # BUILD LINEAGE GRAPH EDGES
-        #######################################################################
-
-        for inp in inputs:
-
-            for out in outputs:
-
-                aris_context["lineage_edges"].append({
-                    "source": inp,
-                    "recipe": r["name"],
-                    "target": out
-                })
+        project_scan["datasets"].append({
+            "name": dataset_name
+        })
 
     except Exception as e:
 
-        aris_context["recipes"].append({
-            "name": r["name"],
+        dataset_registry[dataset_name] = {
             "error": str(e)
-        })
-
-###############################################################################
-# STEP 5 - RECIPE STATISTICS
-###############################################################################
-
-recipe_distribution = Counter(
-    [
-        r["type"]
-        for r in aris_context["recipes"]
-        if "type" in r
-    ]
-)
-
-###############################################################################
-# STEP 6 - GENERATE SME DOCUMENT
-###############################################################################
-
-sme_doc = []
-
-sme_doc.append(f"# {aris_context['project']}")
-sme_doc.append("")
-
-sme_doc.append("## Project Overview")
-sme_doc.append("")
-sme_doc.append(f"Project Key: {aris_context['project']}")
-sme_doc.append(f"Datasets: {aris_context['dataset_count']}")
-sme_doc.append(f"Recipes: {aris_context['recipe_count']}")
-sme_doc.append(f"Lineage Relationships: {len(aris_context['lineage_edges'])}")
-sme_doc.append("")
-
-###############################################################################
-# ARCHITECTURE SUMMARY
-###############################################################################
-
-sme_doc.append("## Recipe Distribution")
-sme_doc.append("")
-
-for k, v in recipe_distribution.items():
-
-    sme_doc.append(f"- {k}: {v}")
-
-sme_doc.append("")
-
-###############################################################################
-# ARIS OBSERVATIONS
-###############################################################################
-
-sme_doc.append("## ARIS Architecture Observations")
-sme_doc.append("")
-
-if recipe_distribution.get("sql_query", 0) > 0:
-
-    sme_doc.append(
-        "- SQL-heavy transformation architecture detected"
-    )
-
-if recipe_distribution.get("join", 0) > 0:
-
-    sme_doc.append(
-        "- Significant dataset integration through joins"
-    )
-
-if recipe_distribution.get("python", 0) > 0:
-
-    sme_doc.append(
-        "- Python-based custom processing present"
-    )
-
-if recipe_distribution.get("pyspark", 0) > 0:
-
-    sme_doc.append(
-        "- Distributed processing components detected"
-    )
-
-sme_doc.append(
-    "- Lineage relationships reconstructed from Dataiku metadata"
-)
-
-sme_doc.append("")
-
-###############################################################################
-# DATASET CATALOG
-###############################################################################
-
-sme_doc.append("## Sample Dataset Catalog")
-sme_doc.append("")
-
-for ds in aris_context["datasets"][:10]:
-
-    sme_doc.append(f"### {ds.get('name')}")
-    sme_doc.append(f"- Connection: {ds.get('connection')}")
-    sme_doc.append(f"- Schema: {ds.get('schema')}")
-    sme_doc.append(f"- Table: {ds.get('table')}")
-    sme_doc.append(f"- Columns: {ds.get('column_count')}")
-    sme_doc.append("")
-
-###############################################################################
-# NEW ENGINEER GUIDE
-###############################################################################
-
-sme_doc.append("## New Engineer Onboarding Guide")
-sme_doc.append("")
-sme_doc.append(
-    "A new engineer should first understand:"
-)
-sme_doc.append("")
-sme_doc.append("1. Source datasets")
-sme_doc.append("2. Join relationships")
-sme_doc.append("3. Python processing recipes")
-sme_doc.append("4. Output datasets")
-sme_doc.append("5. Snowflake schemas and tables")
-sme_doc.append("6. Key business entities represented in datasets")
-sme_doc.append("")
-
-###############################################################################
-# STEP 7 - SAVE OUTPUT FILES
-###############################################################################
-
-with open("aris_project_context.json", "w") as f:
-
-    json.dump(
-        aris_context,
-        f,
-        indent=4
-    )
-
-with open("ARIS_SME_GUIDE.md", "w") as f:
-
-    f.write("\n".join(sme_doc))
-
-###############################################################################
-# STEP 8 - EXECUTION SUMMARY
-###############################################################################
-
-print("\n")
-print("=" * 60)
-print("ARIS KNOWLEDGE BUILD COMPLETE")
-print("=" * 60)
-
-print(f"Project            : {aris_context['project']}")
-print(f"Datasets           : {aris_context['dataset_count']}")
-print(f"Recipes            : {aris_context['recipe_count']}")
-print(f"Lineage Edges      : {len(aris_context['lineage_edges'])}")
-
-print("\nGenerated Artifacts")
-print("---------------------")
-print("1. aris_project_context.json")
-print("2. ARIS_SME_GUIDE.md")
-
-print("\nPhase 1 Status")
-print("---------------------")
-print("Project Discovery      ✅")
-print("Dataset Discovery      ✅")
-print("Recipe Discovery       ✅")
-print("Lineage Discovery      ✅")
-print("SME Documentation      ✅")
-
-
-# In[ ]:
-
-
-
-
-
-# In[9]:
-
-
-###############################################################################
-# ARIS v2.7 - FINAL REQUEST IMPACT ANALYZER
-#
-# ARIS: AI for Request Impact & Scoping
-#
-# PURPOSE
-# -------
-# Analyze one or more requested attributes independently using the project
-# metadata and dataset-level lineage generated by ARIS Phase 1.
-#
-# OUTPUTS (ONLY TWO)
-# ------------------
-# 1. ARIS_IMPACT_ANALYSIS.json  -> complete machine-readable analysis
-# 2. ARIS_IMPACT_ANALYSIS.md    -> complete human-readable report and matrices
-#
-# IMPORTANT LIMITATION
-# --------------------
-# This version uses dataset schemas and dataset-level lineage. It does not
-# prove whether a column is passed through, renamed, transformed, aggregated,
-# filtered, or dropped inside SQL, Python, PySpark, Join, or custom recipes.
-# Human validation remains mandatory.
-###############################################################################
-
-import json
-import os
-import re
-from collections import defaultdict, deque
-from datetime import datetime
-
-
-###############################################################################
-# STEP 1 - CONFIGURE THE CHANGE REQUEST
-###############################################################################
-
-CHANGE_REQUEST = """
-Assess the impact of adding or propagating BRAND and Camapaign and ABC and ACTIVITY_ID to downstream outputs.
-"""
-
-# Add one or more requested attributes. Each attribute is assessed independently.
-SEARCH_TERMS = [
-    "BRAND",
-    "ACTIVITY_ID",
-    "CAMPAIGN",
-    "ABC"
-]
-
-MAX_DOWNSTREAM_DEPTH = 10
-MAX_PATHS_PER_MATCH = 50
-PHASE_1_CONTEXT_FILE = "aris_project_context.json"
-
-# Final Phase 2 outputs. Each run replaces the previous report intentionally.
-JSON_OUTPUT_FILE = "ARIS_IMPACT_ANALYSIS.json"
-MARKDOWN_OUTPUT_FILE = "ARIS_IMPACT_ANALYSIS.md"
-
-
-###############################################################################
-# STEP 2 - HELPER FUNCTIONS
-###############################################################################
-
-def normalize_name(value):
-    """Normalize names for case- and separator-insensitive comparison."""
-    if value is None:
-        return ""
-    return re.sub(r"[^a-z0-9]", "", str(value).lower())
-
-
-def unique_terms(values):
-    """Remove blank and duplicate search terms while preserving order."""
-    seen = set()
-    output = []
-
-    for value in values:
-        clean_value = str(value).strip()
-        key = normalize_name(clean_value)
-
-        if clean_value and key and key not in seen:
-            seen.add(key)
-            output.append(clean_value)
-
-    return output
-
-
-def deduplicate_dicts(records, fields):
-    """Deduplicate dictionaries using selected fields."""
-    seen = set()
-    output = []
-
-    for record in records:
-        key = tuple(record.get(field) for field in fields)
-        if key not in seen:
-            seen.add(key)
-            output.append(record)
-
-    return output
-
-
-def complexity_label(score):
-    """Convert the transparent PoC complexity score into a label."""
-    if score >= 8:
-        return "High"
-    if score >= 4:
-        return "Medium"
-    return "Low"
-
-
-def risk_label(score):
-    """Convert the transparent PoC risk score into a label."""
-    if score >= 7:
-        return "High"
-    if score >= 4:
-        return "Medium"
-    return "Low"
-
-
-def markdown_table(records, columns):
-    """Convert dictionaries into a Markdown table."""
-    if not records:
-        return "_No records found._"
-
-    lines = [
-        "| " + " | ".join(columns) + " |",
-        "| " + " | ".join(["---"] * len(columns)) + " |"
-    ]
-
-    for record in records:
-        cells = []
-        for column in columns:
-            value = record.get(column, "")
-            if value is None:
-                value = ""
-            value = str(value).replace("|", "\\|").replace("\n", " ")
-            cells.append(value)
-        lines.append("| " + " | ".join(cells) + " |")
-
-    return "\n".join(lines)
-
-
-def console_table(records, columns):
-    """Print a compact console table."""
-    if not records:
-        print("No records found.")
-        return
-
-    widths = {
-        column: max(
-            len(column),
-            max(len(str(record.get(column, ""))) for record in records)
-        )
-        for column in columns
-    }
-
-    header = " | ".join(column.ljust(widths[column]) for column in columns)
-    separator = "-+-".join("-" * widths[column] for column in columns)
-
-    print(header)
-    print(separator)
-
-    for record in records:
-        print(
-            " | ".join(
-                str(record.get(column, "")).ljust(widths[column])
-                for column in columns
-            )
-        )
-
-
-###############################################################################
-# STEP 3 - NORMALIZE REQUESTED ATTRIBUTES
-###############################################################################
-
-SEARCH_TERMS = unique_terms(SEARCH_TERMS)
-
-if not SEARCH_TERMS:
-    raise ValueError("SEARCH_TERMS must contain at least one requested attribute.")
-
-
-###############################################################################
-# STEP 4 - LOAD AND VALIDATE PHASE 1 CONTEXT
-###############################################################################
-
-# Use notebook memory when available; otherwise load the Phase 1 JSON artifact.
-if "aris_context" not in globals():
-    if not os.path.exists(PHASE_1_CONTEXT_FILE):
-        raise FileNotFoundError(
-            f"Could not find '{PHASE_1_CONTEXT_FILE}'. "
-            "Run ARIS Phase 1 first or update PHASE_1_CONTEXT_FILE."
-        )
-
-    with open(PHASE_1_CONTEXT_FILE, "r", encoding="utf-8") as context_file:
-        aris_context = json.load(context_file)
-
-    print("Phase 1 context loaded from file.")
-else:
-    print("Phase 1 context loaded from notebook memory.")
-
-required_context_keys = {"project", "datasets", "recipes", "lineage_edges"}
-missing_context_keys = required_context_keys.difference(aris_context.keys())
-
-if missing_context_keys:
-    raise ValueError(
-        "ARIS Phase 1 context is incomplete. Missing keys: "
-        + ", ".join(sorted(missing_context_keys))
-    )
-
-print("=" * 78)
-print("ARIS v2.7 - FINAL REQUEST IMPACT ANALYZER")
-print("=" * 78)
-print(f"Project      : {aris_context['project']}")
-print(f"Request      : {CHANGE_REQUEST.strip()}")
-print(f"Search Terms : {', '.join(SEARCH_TERMS)}")
-print()
-
-
-###############################################################################
-# STEP 5 - BUILD DATASET, COLUMN, RECIPE, AND LINEAGE INDEXES
-###############################################################################
-
-dataset_by_name = {}
-recipe_by_name = {}
-column_index = defaultdict(list)
-downstream_edges = defaultdict(list)
-upstream_edges = defaultdict(list)
-dataset_extraction_errors = []
-recipe_extraction_errors = []
-
-# Dataset and column index
-for dataset in aris_context["datasets"]:
-    dataset_name = dataset.get("name")
-    if not dataset_name:
-        continue
-
-    dataset_by_name[dataset_name] = dataset
-
-    if dataset.get("error"):
-        dataset_extraction_errors.append({
-            "dataset": dataset_name,
-            "error": dataset.get("error")
-        })
-        continue
-
-    for column in dataset.get("columns", []):
-        if isinstance(column, str):
-            column_name = column
-            column_type = None
-        elif isinstance(column, dict):
-            column_name = column.get("name")
-            column_type = column.get("type")
-        else:
-            continue
-
-        if not column_name:
-            continue
-
-        column_index[normalize_name(column_name)].append({
-            "dataset": dataset_name,
-            "column": column_name,
-            "column_type": column_type,
-            "connection": dataset.get("connection"),
-            "schema": dataset.get("schema"),
-            "table": dataset.get("table")
-        })
-
-# Recipe index
-for recipe in aris_context["recipes"]:
-    recipe_name = recipe.get("name")
-    if not recipe_name:
-        continue
-
-    recipe_by_name[recipe_name] = recipe
-
-    if recipe.get("error"):
-        recipe_extraction_errors.append({
-            "recipe": recipe_name,
-            "error": recipe.get("error")
-        })
-
-# Dataset-level lineage index
-for edge in aris_context["lineage_edges"]:
-    source = edge.get("source")
-    recipe = edge.get("recipe")
-    target = edge.get("target")
-
-    if not source or not recipe or not target:
-        continue
-
-    clean_edge = {
-        "source": source,
-        "recipe": recipe,
-        "target": target
-    }
-
-    downstream_edges[source].append(clean_edge)
-    upstream_edges[target].append(clean_edge)
-
-
-###############################################################################
-# STEP 6 - COLUMN SEARCH
-###############################################################################
-
-def find_column_matches(search_term):
-    """Return exact and partial dataset-column matches for one attribute."""
-    normalized_term = normalize_name(search_term)
-    exact_matches = []
-    partial_matches = []
-
-    for normalized_column, locations in column_index.items():
-        if normalized_column == normalized_term:
-            for location in locations:
-                exact_matches.append({
-                    **location,
-                    "search_term": search_term,
-                    "match_type": "Exact"
-                })
-
-        elif (
-            normalized_term
-            and normalized_column
-            and (
-                normalized_term in normalized_column
-                or normalized_column in normalized_term
-            )
-        ):
-            for location in locations:
-                partial_matches.append({
-                    **location,
-                    "search_term": search_term,
-                    "match_type": "Partial"
-                })
-
-    exact_matches = deduplicate_dicts(
-        exact_matches,
-        ["search_term", "dataset", "column"]
-    )
-    partial_matches = deduplicate_dicts(
-        partial_matches,
-        ["search_term", "dataset", "column"]
-    )
-
-    return exact_matches, partial_matches
-
-
-###############################################################################
-# STEP 7 - DATASET POSITION AND DOWNSTREAM LINEAGE
-###############################################################################
-
-def classify_dataset(dataset_name):
-    """Classify the dataset's structural position in captured lineage."""
-    has_upstream = bool(upstream_edges.get(dataset_name))
-    has_downstream = bool(downstream_edges.get(dataset_name))
-
-    if not has_upstream and has_downstream:
-        return "Source / Entry"
-    if has_upstream and has_downstream:
-        return "Intermediate"
-    if has_upstream and not has_downstream:
-        return "Terminal Output"
-    return "Isolated / External"
-
-
-def trace_downstream(start_dataset, max_depth=10, max_paths=50):
-    """Traverse captured downstream dataset-level lineage."""
-    queue = deque([{
-        "dataset": start_dataset,
-        "depth": 0,
-        "path": [start_dataset],
-        "visited": {start_dataset}
-    }])
-
-    impacted_datasets = set()
-    impacted_recipes = set()
-    completed_paths = []
-    cycles = []
-    truncated = False
-    maximum_depth_reached = 0
-
-    while queue:
-        current = queue.popleft()
-        current_dataset = current["dataset"]
-        current_depth = current["depth"]
-        current_path = current["path"]
-        visited = current["visited"]
-
-        maximum_depth_reached = max(maximum_depth_reached, current_depth)
-        outgoing = downstream_edges.get(current_dataset, [])
-
-        if not outgoing or current_depth >= max_depth:
-            completed_paths.append(current_path)
-            if len(completed_paths) >= max_paths:
-                truncated = True
-                break
-            continue
-
-        for edge in outgoing:
-            next_dataset = edge["target"]
-            recipe_name = edge["recipe"]
-
-            impacted_datasets.add(next_dataset)
-            impacted_recipes.add(recipe_name)
-
-            next_path = (
-                current_path
-                + [f"[Recipe: {recipe_name}]"]
-                + [next_dataset]
-            )
-
-            if next_dataset in visited:
-                cycles.append(next_path)
-                completed_paths.append(next_path + ["[Cycle stopped]"])
-                continue
-
-            queue.append({
-                "dataset": next_dataset,
-                "depth": current_depth + 1,
-                "path": next_path,
-                "visited": visited | {next_dataset}
-            })
-
-    return {
-        "impacted_datasets": sorted(impacted_datasets),
-        "impacted_recipes": sorted(impacted_recipes),
-        "paths": completed_paths,
-        "cycles": cycles,
-        "path_count": len(completed_paths),
-        "maximum_depth_reached": maximum_depth_reached,
-        "truncated": truncated
-    }
-
-
-###############################################################################
-# STEP 8 - ANALYZE EACH ATTRIBUTE INDEPENDENTLY
-###############################################################################
-
-def analyze_attribute(search_term):
-    """Analyze one requested attribute independently."""
-    exact_matches, partial_matches = find_column_matches(search_term)
-
-    # Exact results take precedence. Partial results are used only when no
-    # exact match exists, preventing duplicate candidate inflation.
-    selected_matches = exact_matches if exact_matches else partial_matches
-
-    candidate_analyses = []
-    impacted_recipes = set()
-    impacted_datasets = set()
-
-    for match in selected_matches:
-        downstream = trace_downstream(
-            match["dataset"],
-            MAX_DOWNSTREAM_DEPTH,
-            MAX_PATHS_PER_MATCH
-        )
-
-        candidate_analyses.append({
-            "match_type": match["match_type"],
-            "matched_column": match["column"],
-            "column_type": match.get("column_type"),
-            "dataset": match["dataset"],
-            "dataset_position": classify_dataset(match["dataset"]),
-            "connection": match.get("connection"),
-            "schema": match.get("schema"),
-            "table": match.get("table"),
-            "immediate_upstream": upstream_edges.get(match["dataset"], []),
-            "immediate_downstream": downstream_edges.get(match["dataset"], []),
-            "downstream": downstream
-        })
-
-        impacted_recipes.update(downstream["impacted_recipes"])
-        impacted_datasets.update(downstream["impacted_datasets"])
-
-    # Feasibility and confidence
-    if exact_matches:
-        feasibility = "Potentially Feasible"
-        feasibility_basis = (
-            "At least one exact column-name match was found in the Phase 1 "
-            "dataset schemas."
-        )
-        confidence = "High" if impacted_recipes else "Medium"
-        confidence_basis = (
-            "Exact schema matches and downstream dataset-level lineage were found."
-            if impacted_recipes
-            else "Exact schema matches were found, but no downstream lineage was captured."
-        )
-    elif partial_matches:
-        feasibility = "Requires Validation"
-        feasibility_basis = (
-            "Only partial column-name matches were found. Business meaning and "
-            "naming must be validated."
-        )
-        confidence = "Medium"
-        confidence_basis = "Only partial schema matches were found."
-    else:
-        feasibility = "Not Confirmed"
-        feasibility_basis = (
-            "No matching column was found in the captured dataset schemas."
-        )
-        confidence = "Low"
-        confidence_basis = "No schema evidence was found for the requested attribute."
-
-    # Recipe type distribution
-    recipe_type_distribution = defaultdict(int)
-    for recipe_name in impacted_recipes:
-        recipe_type = recipe_by_name.get(recipe_name, {}).get("type", "unknown")
-        recipe_type_distribution[recipe_type] += 1
-
-    # Transparent complexity score. This is triage, not an effort estimate.
-    recipe_count = len(impacted_recipes)
-    dataset_count = len(impacted_datasets)
-    custom_code_count = (
-        recipe_type_distribution.get("python", 0)
-        + recipe_type_distribution.get("pyspark", 0)
-        + recipe_type_distribution.get("sql_script", 0)
-    )
-    join_count = recipe_type_distribution.get("join", 0)
-
-    complexity_score = 0
-    complexity_reasons = []
-
-    if recipe_count >= 10:
-        complexity_score += 4
-        complexity_reasons.append("10 or more impacted recipes")
-    elif recipe_count >= 5:
-        complexity_score += 3
-        complexity_reasons.append("5 to 9 impacted recipes")
-    elif recipe_count >= 1:
-        complexity_score += 1
-        complexity_reasons.append("1 to 4 impacted recipes")
-
-    if dataset_count >= 10:
-        complexity_score += 3
-        complexity_reasons.append("10 or more impacted datasets")
-    elif dataset_count >= 5:
-        complexity_score += 2
-        complexity_reasons.append("5 to 9 impacted datasets")
-    elif dataset_count >= 1:
-        complexity_score += 1
-        complexity_reasons.append("1 to 4 impacted datasets")
-
-    if custom_code_count >= 3:
-        complexity_score += 3
-        complexity_reasons.append("Multiple custom-code recipes")
-    elif custom_code_count >= 1:
-        complexity_score += 1
-        complexity_reasons.append("At least one custom-code recipe")
-
-    if join_count >= 3:
-        complexity_score += 2
-        complexity_reasons.append("Multiple join recipes")
-    elif join_count >= 1:
-        complexity_score += 1
-        complexity_reasons.append("At least one join recipe")
-
-    complexity = complexity_label(complexity_score)
-
-    # Transparent risk score. This is triage, not delivery risk certification.
-    risk_score = 0
-    risk_reasons = []
-
-    if not exact_matches:
-        risk_score += 3
-        risk_reasons.append("No exact schema match")
-
-    if selected_matches and not impacted_recipes:
-        risk_score += 2
-        risk_reasons.append("No downstream lineage captured")
-
-    if custom_code_count:
-        risk_score += 2
-        risk_reasons.append("Code-level column propagation is unverified")
-
-    if dataset_extraction_errors:
-        risk_score += 1
-        risk_reasons.append("Dataset metadata extraction errors exist")
-
-    if recipe_extraction_errors:
-        risk_score += 1
-        risk_reasons.append("Recipe metadata extraction errors exist")
-
-    if any(item["downstream"]["cycles"] for item in candidate_analyses):
-        risk_score += 1
-        risk_reasons.append("Cycle detected in captured lineage")
-
-    if any(item["downstream"]["truncated"] for item in candidate_analyses):
-        risk_score += 1
-        risk_reasons.append("Configured lineage path limit was reached")
-
-    risk = risk_label(risk_score)
-
-    # Proposed scope actions
-    if feasibility == "Not Confirmed":
-        scope_actions = [
-            {
-                "layer": "Business Requirement",
-                "action": (
-                    "Clarify definition, synonyms, datatype, grain, and sample values."
-                ),
-                "approval": "Business SME"
-            },
-            {
-                "layer": "Upstream Discovery",
-                "action": (
-                    "Search upstream systems or adjacent Dataiku projects."
-                ),
-                "approval": "Data SME"
-            }
-        ]
-    else:
-        scope_actions = [
-            {
-                "layer": "Source",
-                "action": (
-                    "Validate the candidate source dataset and business meaning."
-                ),
-                "approval": "Data Owner / SME"
-            },
-            {
-                "layer": "Transformation",
-                "action": (
-                    "Inspect impacted SQL, join, Python, PySpark, and script "
-                    "recipes for column propagation."
-                ),
-                "approval": "Data Engineer"
-            },
-            {
-                "layer": "Dataset Schema",
-                "action": (
-                    "Confirm which downstream outputs must expose the attribute."
-                ),
-                "approval": "Data Engineer / Consumer"
-            },
-            {
-                "layer": "Data Quality",
-                "action": (
-                    "Validate datatype, nullability, uniqueness, coverage, and permitted use."
-                ),
-                "approval": "Data Owner / SME"
-            },
-            {
-                "layer": "Testing",
-                "action": (
-                    "Define schema, completeness, regression, and consumer tests."
-                ),
-                "approval": "Engineering / QA"
-            },
-            {
-                "layer": "External Consumers",
-                "action": (
-                    "Confirm dashboards, extracts, APIs, and cross-project uses."
-                ),
-                "approval": "Product Owner / Consumer"
-            }
-        ]
-
-    return {
-        "attribute": search_term,
-        "feasibility": feasibility,
-        "feasibility_basis": feasibility_basis,
-        "confidence": confidence,
-        "confidence_basis": confidence_basis,
-        "exact_match_count": len(exact_matches),
-        "partial_match_count": len(partial_matches),
-        "candidate_dataset_count": len(candidate_analyses),
-        "impacted_recipe_count": recipe_count,
-        "impacted_dataset_count": dataset_count,
-        "complexity": complexity,
-        "complexity_score": complexity_score,
-        "complexity_reasons": complexity_reasons,
-        "risk": risk,
-        "risk_score": risk_score,
-        "risk_reasons": risk_reasons,
-        "recipe_type_distribution": dict(recipe_type_distribution),
-        "candidate_analyses": candidate_analyses,
-        "impacted_recipes": sorted(impacted_recipes),
-        "impacted_datasets": sorted(impacted_datasets),
-        "scope_actions": scope_actions,
-        "human_review_required": True
-    }
-
-
-###############################################################################
-# STEP 9 - RUN ALL ATTRIBUTES AND CREATE THE SUMMARY MATRIX
-###############################################################################
-
-attribute_results = [analyze_attribute(term) for term in SEARCH_TERMS]
-
-attribute_matrix = []
-for result in attribute_results:
-    attribute_matrix.append({
-        "Attribute": result["attribute"],
-        "Status": result["feasibility"],
-        "Confidence": result["confidence"],
-        "Exact": result["exact_match_count"],
-        "Partial": result["partial_match_count"],
-        "Candidates": result["candidate_dataset_count"],
-        "Recipes": result["impacted_recipe_count"],
-        "Datasets": result["impacted_dataset_count"],
-        "Complexity": result["complexity"],
-        "Risk": result["risk"]
-    })
-
-found_attributes = [
-    result["attribute"]
-    for result in attribute_results
-    if result["feasibility"] == "Potentially Feasible"
-]
-partial_attributes = [
-    result["attribute"]
-    for result in attribute_results
-    if result["feasibility"] == "Requires Validation"
-]
-not_found_attributes = [
-    result["attribute"]
-    for result in attribute_results
-    if result["feasibility"] == "Not Confirmed"
-]
-
-
-###############################################################################
-# STEP 10 - OVERALL REQUEST ASSESSMENT
-###############################################################################
-
-if all(
-    result["feasibility"] == "Potentially Feasible"
-    for result in attribute_results
-):
-    overall_feasibility = "Potentially Feasible"
-elif any(
-    result["feasibility"] == "Not Confirmed"
-    for result in attribute_results
-):
-    overall_feasibility = "Partially Feasible / Requires Clarification"
-else:
-    overall_feasibility = "Requires Validation"
-
-overall_complexity_score = max(
-    (result["complexity_score"] for result in attribute_results),
-    default=0
-)
-overall_risk_score = max(
-    (result["risk_score"] for result in attribute_results),
-    default=0
-)
-overall_complexity = complexity_label(overall_complexity_score)
-overall_risk = risk_label(overall_risk_score)
-
-
-###############################################################################
-# STEP 11 - BUILD THE SINGLE MACHINE-READABLE REPORT
-###############################################################################
-
-impact_report = {
-    "aris_version": "2.7-final",
-    "analysis_type": "per_attribute_metadata_and_lineage_impact",
-    "generated_at": datetime.now().isoformat(timespec="seconds"),
-    "project": aris_context["project"],
-    "change_request": CHANGE_REQUEST.strip(),
-    "search_terms": SEARCH_TERMS,
-    "analysis_contract": {
-        "unit_of_analysis": "attribute",
-        "matching_rule": "exact preferred; partial used only if exact absent",
-        "lineage_level": "dataset",
-        "column_propagation_proven": False,
-        "human_approval_required": True
-    },
-    "phase_1_coverage": {
-        "dataset_count": aris_context.get("dataset_count"),
-        "recipe_count": aris_context.get("recipe_count"),
-        "lineage_edge_count": len(aris_context.get("lineage_edges", [])),
-        "dataset_extraction_error_count": len(dataset_extraction_errors),
-        "recipe_extraction_error_count": len(recipe_extraction_errors)
-    },
-    "overall_assessment": {
-        "feasibility": overall_feasibility,
-        "complexity": overall_complexity,
-        "complexity_score": overall_complexity_score,
-        "risk": overall_risk,
-        "risk_score": overall_risk_score,
-        "human_review_required": True,
-        "attributes_requested": len(SEARCH_TERMS),
-        "attributes_found": len(found_attributes),
-        "attributes_partial": len(partial_attributes),
-        "attributes_not_found": len(not_found_attributes),
-        "found_attribute_names": found_attributes,
-        "partial_attribute_names": partial_attributes,
-        "not_found_attribute_names": not_found_attributes
-    },
-    "attribute_matrix": attribute_matrix,
-    "attribute_results": attribute_results,
-    "limitations": [
-        "Dataset-level lineage does not prove column-level propagation.",
-        "SQL, Join, Python, PySpark, and script logic require inspection.",
-        "Column presence does not prove correct business meaning.",
-        "Consumers outside the captured Dataiku project may be missing.",
-        "Effort, cost, and delivery duration are not estimated by this version.",
-        "All recommendations require human validation."
-    ]
-}
-
-
-###############################################################################
-# STEP 12 - BUILD THE SINGLE HUMAN-READABLE REPORT
-###############################################################################
-
-md = [
-    "# ARIS Change Impact Assessment",
-    "",
-    f"**Project:** {impact_report['project']}",
-    f"**Generated:** {impact_report['generated_at']}",
-    f"**ARIS Version:** {impact_report['aris_version']}",
-    "",
-    "## Change Request",
-    "",
-    CHANGE_REQUEST.strip(),
-    "",
-    "## Overall Assessment",
-    "",
-    f"- **Feasibility:** {overall_feasibility}",
-    f"- **Complexity:** {overall_complexity}",
-    f"- **Risk:** {overall_risk}",
-    "- **Human Review:** Required",
-    f"- **Attributes Requested:** {len(SEARCH_TERMS)}",
-    f"- **Found:** {len(found_attributes)} ({', '.join(found_attributes) or 'None'})",
-    f"- **Partial:** {len(partial_attributes)} ({', '.join(partial_attributes) or 'None'})",
-    f"- **Not Found:** {len(not_found_attributes)} ({', '.join(not_found_attributes) or 'None'})",
-    "",
-    "## Attribute Assessment Matrix",
-    "",
-    markdown_table(
-        attribute_matrix,
-        [
-            "Attribute", "Status", "Confidence", "Exact", "Partial",
-            "Candidates", "Recipes", "Datasets", "Complexity", "Risk"
-        ]
-    ),
-    "",
-    "## Attribute-Level Findings",
-    ""
-]
-
-for result in attribute_results:
-    md.extend([
-        f"### {result['attribute']}",
-        "",
-        f"- **Feasibility:** {result['feasibility']}",
-        f"- **Basis:** {result['feasibility_basis']}",
-        f"- **Confidence:** {result['confidence']}",
-        f"- **Complexity:** {result['complexity']} (score {result['complexity_score']})",
-        f"- **Risk:** {result['risk']} (score {result['risk_score']})",
-        f"- **Exact Matches:** {result['exact_match_count']}",
-        f"- **Partial Matches:** {result['partial_match_count']}",
-        f"- **Candidate Datasets:** {result['candidate_dataset_count']}",
-        f"- **Impacted Recipes:** {result['impacted_recipe_count']}",
-        f"- **Impacted Datasets:** {result['impacted_dataset_count']}",
-        ""
-    ])
-
-    if result["complexity_reasons"]:
-        md.append("**Complexity Factors**")
-        md.append("")
-        for reason in result["complexity_reasons"]:
-            md.append(f"- {reason}")
-        md.append("")
-
-    if result["risk_reasons"]:
-        md.append("**Risk Factors**")
-        md.append("")
-        for reason in result["risk_reasons"]:
-            md.append(f"- {reason}")
-        md.append("")
-
-    md.append("**Candidate Dataset Evidence**")
-    md.append("")
-
-    if result["candidate_analyses"]:
-        candidate_rows = []
-        for candidate in result["candidate_analyses"]:
-            candidate_rows.append({
-                "Match": candidate["match_type"],
-                "Column": candidate["matched_column"],
-                "Dataset": candidate["dataset"],
-                "Position": candidate["dataset_position"],
-                "Schema": candidate["schema"],
-                "Table": candidate["table"],
-                "Recipes": len(candidate["downstream"]["impacted_recipes"]),
-                "Datasets": len(candidate["downstream"]["impacted_datasets"])
-            })
-
-        md.append(
-            markdown_table(
-                candidate_rows,
-                [
-                    "Match", "Column", "Dataset", "Position", "Schema",
-                    "Table", "Recipes", "Datasets"
-                ]
-            )
-        )
-    else:
-        md.append("_No candidate dataset found._")
-
-    md.append("")
-    md.append("**Potentially Impacted Recipes**")
-    md.append("")
-
-    if result["impacted_recipes"]:
-        impacted_recipe_rows = []
-        for recipe_name in result["impacted_recipes"]:
-            recipe_metadata = recipe_by_name.get(recipe_name, {})
-            impacted_recipe_rows.append({
-                "Recipe": recipe_name,
-                "Type": recipe_metadata.get("type", "unknown"),
-                "Inputs": len(recipe_metadata.get("inputs", [])),
-                "Outputs": len(recipe_metadata.get("outputs", [])),
-                "Propagation": "Unknown - review required"
-            })
-
-        md.append(
-            markdown_table(
-                impacted_recipe_rows,
-                ["Recipe", "Type", "Inputs", "Outputs", "Propagation"]
-            )
-        )
-    else:
-        md.append("_No downstream recipe impact confirmed._")
-
-    md.append("")
-    md.append("**Potentially Impacted Datasets**")
-    md.append("")
-
-    if result["impacted_datasets"]:
-        for dataset_name in result["impacted_datasets"]:
-            md.append(f"- {dataset_name}")
-    else:
-        md.append("_No downstream dataset impact confirmed._")
-
-    md.append("")
-    md.append("**Proposed Scope**")
-    md.append("")
-
-    scope_rows = []
-    for action in result["scope_actions"]:
-        scope_rows.append({
-            "Layer": action["layer"],
-            "Action": action["action"],
-            "Approval": action["approval"]
-        })
-
-    md.append(markdown_table(scope_rows, ["Layer", "Action", "Approval"]))
-    md.append("")
-
-md.extend([
-    "## Current Limitations",
-    ""
-])
-
-for limitation in impact_report["limitations"]:
-    md.append(f"- {limitation}")
-
-md.extend([
-    "",
-    "## Final Decision",
-    "",
-    "This is a preliminary metadata and dataset-lineage assessment. The "
-    "identified recipes must be inspected to determine whether each requested "
-    "attribute is passed through, renamed, transformed, filtered, aggregated, "
-    "or dropped. Human validation is required before implementation approval.",
-    ""
-])
-
-impact_markdown = "\n".join(md)
-
-
-###############################################################################
-# STEP 13 - SAVE ONLY THE TWO REQUIRED PHASE 2 ARTIFACTS
-###############################################################################
-
-with open(JSON_OUTPUT_FILE, "w", encoding="utf-8") as output:
-    json.dump(
-        impact_report,
-        output,
-        indent=4,
-        ensure_ascii=False,
-        default=str
-    )
-
-with open(MARKDOWN_OUTPUT_FILE, "w", encoding="utf-8") as output:
-    output.write(impact_markdown)
-
-
-###############################################################################
-# STEP 14 - PRINT CONSOLE MATRIX AND SUMMARY
-###############################################################################
-
-print()
-print("=" * 110)
-print("ARIS v2.7 FINAL IMPACT ANALYSIS COMPLETE")
-print("=" * 110)
-print(f"Project             : {aris_context['project']}")
-print(f"Overall Feasibility : {overall_feasibility}")
-print(f"Overall Complexity  : {overall_complexity}")
-print(f"Overall Risk        : {overall_risk}")
-print(f"Attributes Requested: {len(SEARCH_TERMS)}")
-print(f"Found               : {len(found_attributes)} ({', '.join(found_attributes) or 'None'})")
-print(f"Partial             : {len(partial_attributes)} ({', '.join(partial_attributes) or 'None'})")
-print(f"Not Found           : {len(not_found_attributes)} ({', '.join(not_found_attributes) or 'None'})")
-print()
-
-print("ATTRIBUTE ASSESSMENT MATRIX")
-print("-" * 110)
-console_table(
-    attribute_matrix,
-    [
-        "Attribute", "Status", "Confidence", "Exact", "Partial",
-        "Candidates", "Recipes", "Datasets", "Complexity", "Risk"
-    ]
-)
-
-print()
-print("Generated Artifacts")
-print("-" * 110)
-print(f"1. {JSON_OUTPUT_FILE}")
-print(f"2. {MARKDOWN_OUTPUT_FILE}")
-
-print()
-print("IMPORTANT")
-print("-" * 110)
-print(
-    "Complexity and risk are transparent PoC triage scores. They are not "
-    "effort, cost, duration, or delivery commitments."
-)
-print(
-    "Human review remains required before approving the implementation scope."
-)
-
-
-###############################################################################
-# FINAL PHASE 2 ACCEPTANCE CRITERIA
-###############################################################################
-# - One or many attributes are assessed independently.
-# - Exact matches are preferred over partial matches.
-# - Missing attributes remain Not Confirmed even if another term is found.
-# - Dataset-level lineage is not presented as proven column propagation.
-# - The JSON contains the complete machine-readable analysis.
-# - The Markdown contains all matrices and human-readable evidence.
-# - Only two Phase 2 artifacts are generated.
-# - Human approval remains mandatory.
-###############################################################################
-
-
-# In[10]:
-
-
-###############################################################################
-# ARIS PHASE 3 v1.0 - TRANSFORMATION & COLUMN-LINEAGE INTELLIGENCE
-#
-# PURPOSE
-# -------
-# Use Phase 2 results to inspect only the potentially impacted Dataiku recipes
-# and determine how each requested attribute appears to behave at every hop.
-#
-# INPUTS
-# ------
-# 1. ARIS Phase 1 context:
-#       aris_context in notebook memory OR aris_project_context.json
-# 2. ARIS Phase 2 result:
-#       ARIS_IMPACT_ANALYSIS.json
-# 3. Current Dataiku project API access
-#
-# OUTPUTS (ONLY TWO)
-# ------------------
-# 1. ARIS_TRANSFORMATION_ANALYSIS.json
-# 2. ARIS_TRANSFORMATION_ANALYSIS.md
-#
-# CLASSIFICATIONS
-# ---------------
-# PASSTHROUGH       Attribute exists in both known input and output schemas.
-# CREATED           Attribute absent from known inputs but present in outputs.
-# DROPPED           Attribute present in known inputs but absent from outputs.
-# REFERENCED        Attribute appears in recipe definition/payload/code.
-# JOIN_KEY          Attribute is referenced in a Join recipe.
-# FILTER_OR_RULE    Attribute is referenced in a Prepare/Filter/Window recipe.
-# TRANSFORMED       Attribute is referenced in Python/SQL/custom code and is
-#                   present in an output schema.
-# UNKNOWN           Evidence is insufficient or extraction is unsupported.
-# NOT_APPLICABLE    Attribute was not found by Phase 2.
-#
-# IMPORTANT
-# ---------
-# These are evidence-based PoC classifications, not final implementation
-# decisions. Visual recipe configurations and custom plugin payloads differ by
-# Dataiku version. UNKNOWN results must be reviewed by an engineer or SME.
-###############################################################################
-
-import dataiku
-import json
-import os
-import re
-from datetime import datetime
-from collections import defaultdict
-
-
-###############################################################################
-# STEP 1 - CONFIGURATION
-###############################################################################
-
-PHASE_1_CONTEXT_FILE = "aris_project_context.json"
-PHASE_2_IMPACT_FILE = "ARIS_IMPACT_ANALYSIS.json"
-
-JSON_OUTPUT_FILE = "ARIS_TRANSFORMATION_ANALYSIS.json"
-MARKDOWN_OUTPUT_FILE = "ARIS_TRANSFORMATION_ANALYSIS.md"
-
-# Limits for safe report sizes. Full raw payloads are NOT written to artifacts.
-MAX_EVIDENCE_SNIPPET_LENGTH = 600
-MAX_PAYLOAD_PREVIEW_LENGTH = 2000
-
-
-###############################################################################
-# STEP 2 - HELPER FUNCTIONS
-###############################################################################
-
-def normalize_name(value):
-    """Normalize names for case- and separator-insensitive comparison."""
-    if value is None:
-        return ""
-    return re.sub(r"[^a-z0-9]", "", str(value).lower())
-
-
-def unique_preserve_order(values):
-    """Remove duplicates while preserving order."""
-    seen = set()
-    output = []
-    for value in values:
-        key = json.dumps(value, sort_keys=True, default=str) if isinstance(value, (dict, list)) else str(value)
-        if key not in seen:
-            seen.add(key)
-            output.append(value)
-    return output
-
-
-def to_serializable(value):
-    """Convert Dataiku/API payload objects into JSON-compatible structures."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, dict):
-        return {str(k): to_serializable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [to_serializable(v) for v in value]
-    if hasattr(value, "to_dict"):
-        try:
-            return to_serializable(value.to_dict())
-        except Exception:
-            pass
-    if hasattr(value, "__dict__"):
-        try:
-            return to_serializable(value.__dict__)
-        except Exception:
-            pass
-    return repr(value)
-
-
-def flatten_strings(value, path="root"):
-    """Recursively collect strings from a nested definition/payload."""
-    flattened = []
-
-    if isinstance(value, str):
-        flattened.append({"path": path, "text": value})
-
-    elif isinstance(value, dict):
-        for key, child in value.items():
-            flattened.extend(flatten_strings(child, f"{path}.{key}"))
-
-    elif isinstance(value, (list, tuple)):
-        for index, child in enumerate(value):
-            flattened.extend(flatten_strings(child, f"{path}[{index}]"))
-
-    return flattened
-
-
-def attribute_regex(attribute):
-    """Build a conservative, case-insensitive attribute reference pattern."""
-    parts = [part for part in re.split(r"[^A-Za-z0-9]+", str(attribute)) if part]
-    if not parts:
-        return re.compile(r"a^")
-
-    # Allow underscore, hyphen, whitespace, or dot between attribute tokens.
-    separator = r"[\s_.-]*"
-    pattern = r"(?<![A-Za-z0-9])" + separator.join(re.escape(part) for part in parts) + r"(?![A-Za-z0-9])"
-    return re.compile(pattern, re.IGNORECASE)
-
-
-def extract_attribute_evidence(attribute, flattened_strings):
-    """Return paths and snippets containing the requested attribute."""
-    pattern = attribute_regex(attribute)
-    evidence = []
-
-    for item in flattened_strings:
-        text = item["text"]
-        match = pattern.search(text)
-        if not match:
-            continue
-
-        start = max(0, match.start() - 180)
-        end = min(len(text), match.end() + 260)
-        snippet = text[start:end].replace("\n", " ").strip()
-
-        if len(snippet) > MAX_EVIDENCE_SNIPPET_LENGTH:
-            snippet = snippet[:MAX_EVIDENCE_SNIPPET_LENGTH] + "..."
-
-        evidence.append({
-            "path": item["path"],
-            "snippet": snippet
-        })
-
-    return unique_preserve_order(evidence)
-
-
-def markdown_table(records, columns):
-    """Create a Markdown table."""
-    if not records:
-        return "_No records found._"
-
-    lines = [
-        "| " + " | ".join(columns) + " |",
-        "| " + " | ".join(["---"] * len(columns)) + " |"
-    ]
-
-    for record in records:
-        cells = []
-        for column in columns:
-            value = record.get(column, "")
-            if value is None:
-                value = ""
-            value = str(value).replace("|", "\\|").replace("\n", " ")
-            cells.append(value)
-        lines.append("| " + " | ".join(cells) + " |")
-
-    return "\n".join(lines)
-
-
-def console_table(records, columns):
-    """Print a compact matrix in the notebook output."""
-    if not records:
-        print("No records found.")
-        return
-
-    widths = {
-        column: max(
-            len(column),
-            max(len(str(record.get(column, ""))) for record in records)
-        )
-        for column in columns
-    }
-
-    header = " | ".join(column.ljust(widths[column]) for column in columns)
-    separator = "-+-".join("-" * widths[column] for column in columns)
-
-    print(header)
-    print(separator)
-    for record in records:
-        print(
-            " | ".join(
-                str(record.get(column, "")).ljust(widths[column])
-                for column in columns
-            )
-        )
-
-
-###############################################################################
-# STEP 3 - LOAD PHASE 1 AND PHASE 2 ARTIFACTS
-###############################################################################
-
-if "aris_context" not in globals():
-    if not os.path.exists(PHASE_1_CONTEXT_FILE):
-        raise FileNotFoundError(
-            f"Could not find '{PHASE_1_CONTEXT_FILE}'. Run Phase 1 first."
-        )
-    with open(PHASE_1_CONTEXT_FILE, "r", encoding="utf-8") as source:
-        aris_context = json.load(source)
-    print("Phase 1 context loaded from file.")
-else:
-    print("Phase 1 context loaded from notebook memory.")
-
-if not os.path.exists(PHASE_2_IMPACT_FILE):
-    raise FileNotFoundError(
-        f"Could not find '{PHASE_2_IMPACT_FILE}'. Run final Phase 2 first."
-    )
-
-with open(PHASE_2_IMPACT_FILE, "r", encoding="utf-8") as source:
-    phase2_impact = json.load(source)
-
-required_phase1_keys = {"project", "datasets", "recipes", "lineage_edges"}
-missing_phase1_keys = required_phase1_keys.difference(aris_context.keys())
-if missing_phase1_keys:
-    raise ValueError(
-        "Phase 1 context is incomplete. Missing keys: "
-        + ", ".join(sorted(missing_phase1_keys))
-    )
-
-if "attribute_results" not in phase2_impact:
-    raise ValueError(
-        "Phase 2 JSON does not contain 'attribute_results'. "
-        "Run ARIS Phase 2 v2.7 final first."
-    )
-
-if phase2_impact.get("project") != aris_context.get("project"):
-    raise ValueError(
-        "Phase 1 and Phase 2 project keys do not match. "
-        f"Phase 1: {aris_context.get('project')} | "
-        f"Phase 2: {phase2_impact.get('project')}"
-    )
-
-
-###############################################################################
-# STEP 4 - CONNECT TO THE CURRENT DATAIKU PROJECT
-###############################################################################
-
-client = dataiku.api_client()
-project = client.get_default_project()
-
-if project.project_key != aris_context["project"]:
-    raise ValueError(
-        "The current Dataiku notebook project does not match the Phase 1 context. "
-        f"Notebook project: {project.project_key} | "
-        f"Phase 1 project: {aris_context['project']}"
-    )
-
-print("=" * 90)
-print("ARIS PHASE 3 - TRANSFORMATION & COLUMN-LINEAGE INTELLIGENCE")
-print("=" * 90)
-print(f"Project        : {project.project_key}")
-print(f"Phase 2 Input  : {PHASE_2_IMPACT_FILE}")
-print()
-
-
-###############################################################################
-# STEP 5 - BUILD PHASE 1 LOOKUPS
-###############################################################################
-
-dataset_by_name = {
-    dataset.get("name"): dataset
-    for dataset in aris_context["datasets"]
-    if dataset.get("name")
-}
-
-recipe_by_name = {
-    recipe.get("name"): recipe
-    for recipe in aris_context["recipes"]
-    if recipe.get("name")
-}
-
-
-def dataset_columns(dataset_name):
-    """Return normalized column names available in the Phase 1 schema."""
-    dataset = dataset_by_name.get(dataset_name, {})
-    output = set()
-
-    for column in dataset.get("columns", []):
-        if isinstance(column, str):
-            name = column
-        elif isinstance(column, dict):
-            name = column.get("name")
-        else:
-            name = None
-
-        if name:
-            output.add(normalize_name(name))
-
-    return output
-
-
-def recipe_input_output_columns(recipe_name):
-    """Combine Phase 1 schemas for a recipe's known inputs and outputs."""
-    recipe = recipe_by_name.get(recipe_name, {})
-    input_names = recipe.get("inputs", []) or []
-    output_names = recipe.get("outputs", []) or []
-
-    input_columns = set()
-    output_columns = set()
-
-    for dataset_name in input_names:
-        input_columns.update(dataset_columns(dataset_name))
-
-    for dataset_name in output_names:
-        output_columns.update(dataset_columns(dataset_name))
-
-    return {
-        "inputs": input_names,
-        "outputs": output_names,
-        "input_columns": input_columns,
-        "output_columns": output_columns
-    }
-
-
-###############################################################################
-# STEP 6 - EXTRACT DATAIKU RECIPE DEFINITIONS AND PAYLOADS
-###############################################################################
-
-def extract_recipe_payload(recipe_name):
-    """
-    Read a recipe definition/payload without modifying the recipe.
-
-    get_definition_and_payload() varies by recipe type and Dataiku version.
-    This function stores a serializable structure and extraction metadata.
-    """
-    result = {
-        "recipe": recipe_name,
-        "extraction_status": "unknown",
-        "definition": None,
-        "payload": None,
-        "error": None
-    }
-
-    try:
-        recipe = project.get_recipe(recipe_name)
-        raw = recipe.get_definition_and_payload()
-        serializable = to_serializable(raw)
-
-        if isinstance(serializable, list) and len(serializable) >= 2:
-            result["definition"] = serializable[0]
-            result["payload"] = serializable[1]
-        else:
-            result["definition"] = serializable
-
-        result["extraction_status"] = "success"
-
-    except Exception as error:
-        result["extraction_status"] = "error"
-        result["error"] = str(error)
-
-    return result
-
-
-###############################################################################
-# STEP 7 - CLASSIFY ATTRIBUTE BEHAVIOR PER IMPACTED RECIPE
-###############################################################################
-
-def classify_behavior(
-    attribute,
-    recipe_name,
-    recipe_type,
-    input_present,
-    output_present,
-    code_referenced,
-    extraction_status
-):
-    """Classify behavior from deterministic metadata and payload evidence."""
-    normalized_type = str(recipe_type or "unknown").lower()
-
-    if extraction_status == "error":
-        return "UNKNOWN", "Low", "Recipe definition/payload extraction failed."
-
-    if input_present and output_present:
-        if code_referenced and normalized_type in {
-            "python", "pyspark", "sql_query", "sql_script", "custom"
-        }:
-            return (
-                "TRANSFORMED",
-                "Medium",
-                "Attribute is present in input and output schemas and is referenced in recipe content."
-            )
-        if code_referenced and normalized_type == "join":
-            return (
-                "JOIN_KEY",
-                "Medium",
-                "Attribute is present in input/output schemas and referenced in Join configuration."
-            )
-        return (
-            "PASSTHROUGH",
-            "Medium",
-            "Attribute is present in both known input and output schemas."
-        )
-
-    if not input_present and output_present:
-        if code_referenced:
-            return (
-                "CREATED",
-                "High",
-                "Attribute is absent from known inputs, present in outputs, and referenced in recipe content."
-            )
-        return (
-            "CREATED",
-            "Medium",
-            "Attribute is absent from known input schemas but present in output schemas."
-        )
-
-    if input_present and not output_present:
-        if code_referenced and normalized_type == "join":
-            return (
-                "JOIN_KEY",
-                "Low",
-                "Attribute is referenced in Join configuration but is absent from known output schemas."
-            )
-        if code_referenced and normalized_type in {"prepare", "filter", "window"}:
-            return (
-                "FILTER_OR_RULE",
-                "Low",
-                "Attribute is referenced in visual recipe content but is absent from known output schemas."
-            )
-        if code_referenced:
-            return (
-                "REFERENCED",
-                "Low",
-                "Attribute is referenced in recipe content but is absent from known output schemas."
-            )
-        return (
-            "DROPPED",
-            "Medium",
-            "Attribute is present in known input schemas and absent from known output schemas."
-        )
-
-    if code_referenced:
-        if normalized_type == "join":
-            return (
-                "JOIN_KEY",
-                "Low",
-                "Attribute is referenced in Join configuration, but schema evidence is incomplete."
-            )
-        if normalized_type in {"prepare", "filter", "window"}:
-            return (
-                "FILTER_OR_RULE",
-                "Low",
-                "Attribute is referenced in recipe configuration, but schema evidence is incomplete."
-            )
-        return (
-            "REFERENCED",
-            "Low",
-            "Attribute appears in recipe content, but input/output schema evidence is incomplete."
-        )
-
-    return (
-        "UNKNOWN",
-        "Low",
-        "No reliable schema or recipe-content evidence was found."
-    )
-
-
-###############################################################################
-# STEP 8 - ANALYZE ONLY PHASE 2 IMPACTED RECIPES
-###############################################################################
-
-analysis_rows = []
-recipe_payload_cache = {}
-unsupported_or_failed_recipes = []
-
-for attribute_result in phase2_impact["attribute_results"]:
-    attribute = attribute_result.get("attribute")
-    feasibility = attribute_result.get("feasibility")
-
-    if feasibility == "Not Confirmed":
-        analysis_rows.append({
-            "attribute": attribute,
-            "recipe": None,
-            "recipe_type": None,
-            "inputs": [],
-            "outputs": [],
-            "input_present": False,
-            "output_present": False,
-            "code_referenced": False,
-            "classification": "NOT_APPLICABLE",
-            "confidence": "Low",
-            "evidence_basis": "Phase 2 did not find the attribute in captured schemas.",
-            "evidence": [],
-            "extraction_status": "not_run"
-        })
-        continue
-
-    impacted_recipes = attribute_result.get("impacted_recipes", []) or []
-
-    if not impacted_recipes:
-        analysis_rows.append({
-            "attribute": attribute,
-            "recipe": None,
-            "recipe_type": None,
-            "inputs": [],
-            "outputs": [],
-            "input_present": False,
-            "output_present": False,
-            "code_referenced": False,
-            "classification": "UNKNOWN",
-            "confidence": "Low",
-            "evidence_basis": "Phase 2 found the attribute but no impacted recipes were captured.",
-            "evidence": [],
-            "extraction_status": "not_run"
-        })
-        continue
-
-    for recipe_name in impacted_recipes:
-        recipe_metadata = recipe_by_name.get(recipe_name, {})
-        recipe_type = recipe_metadata.get("type", "unknown")
-        schema_evidence = recipe_input_output_columns(recipe_name)
-        attribute_key = normalize_name(attribute)
-
-        input_present = attribute_key in schema_evidence["input_columns"]
-        output_present = attribute_key in schema_evidence["output_columns"]
-
-        if recipe_name not in recipe_payload_cache:
-            recipe_payload_cache[recipe_name] = extract_recipe_payload(recipe_name)
-
-        payload_result = recipe_payload_cache[recipe_name]
-        combined_payload = {
-            "definition": payload_result.get("definition"),
-            "payload": payload_result.get("payload")
         }
-        flattened_strings = flatten_strings(combined_payload)
-        evidence = extract_attribute_evidence(attribute, flattened_strings)
-        code_referenced = bool(evidence)
 
-        classification, confidence, basis = classify_behavior(
-            attribute=attribute,
-            recipe_name=recipe_name,
-            recipe_type=recipe_type,
-            input_present=input_present,
-            output_present=output_present,
-            code_referenced=code_referenced,
-            extraction_status=payload_result["extraction_status"]
-        )
+# ==========================================================================
+# SAVE OUTPUTS
+# ==========================================================================
 
-        if payload_result["extraction_status"] != "success":
-            unsupported_or_failed_recipes.append({
-                "recipe": recipe_name,
-                "recipe_type": recipe_type,
-                "error": payload_result.get("error")
-            })
+save_json(
+    "ARIS_PROJECT_GRAPH.json",
+    project_scan
+)
 
-        analysis_rows.append({
-            "attribute": attribute,
-            "recipe": recipe_name,
-            "recipe_type": recipe_type,
-            "inputs": schema_evidence["inputs"],
-            "outputs": schema_evidence["outputs"],
-            "input_present": input_present,
-            "output_present": output_present,
-            "code_referenced": code_referenced,
-            "classification": classification,
-            "confidence": confidence,
-            "evidence_basis": basis,
-            "evidence": evidence,
-            "extraction_status": payload_result["extraction_status"]
-        })
+save_json(
+    "ARIS_RECIPE_INTELLIGENCE.json",
+    recipe_intelligence
+)
 
-unsupported_or_failed_recipes = unique_preserve_order(unsupported_or_failed_recipes)
+save_json(
+    "ARIS_DATASET_REGISTRY.json",
+    dataset_registry
+)
 
+# ==========================================================================
+# SUMMARY
+# ==========================================================================
 
-###############################################################################
-# STEP 9 - BUILD COVERAGE AND CLASSIFICATION SUMMARY
-###############################################################################
+summary = {
 
-classification_counts = defaultdict(int)
-for row in analysis_rows:
-    classification_counts[row["classification"]] += 1
+    "project": PROJECT_KEY,
+    "scan_timestamp": str(datetime.now()),
 
-recipes_requested = sorted({
-    row["recipe"] for row in analysis_rows if row.get("recipe")
-})
-recipes_extracted = sorted({
-    row["recipe"] for row in analysis_rows
-    if row.get("recipe") and row.get("extraction_status") == "success"
-})
+    "recipes": len(project_scan["recipes"]),
+    "datasets": len(project_scan["datasets"]),
+    "edges": len(project_scan["edges"])
 
-summary_matrix = []
-for row in analysis_rows:
-    summary_matrix.append({
-        "Attribute": row["attribute"],
-        "Recipe": row["recipe"] or "N/A",
-        "Type": row["recipe_type"] or "N/A",
-        "Input": "Yes" if row["input_present"] else "No",
-        "Output": "Yes" if row["output_present"] else "No",
-        "Reference": "Yes" if row["code_referenced"] else "No",
-        "Classification": row["classification"],
-        "Confidence": row["confidence"]
-    })
-
-
-###############################################################################
-# STEP 10 - BUILD THE SINGLE MACHINE-READABLE PHASE 3 ARTIFACT
-###############################################################################
-
-transformation_report = {
-    "aris_version": "3.0-poc",
-    "analysis_type": "transformation_and_column_lineage_intelligence",
-    "generated_at": datetime.now().isoformat(timespec="seconds"),
-    "project": aris_context["project"],
-    "phase_2_input": PHASE_2_IMPACT_FILE,
-    "search_terms": phase2_impact.get("search_terms", []),
-    "analysis_contract": {
-        "recipes_analyzed": "Phase 2 impacted recipes only",
-        "recipe_modified": False,
-        "deterministic_evidence_first": True,
-        "llm_used": False,
-        "human_approval_required": True
-    },
-    "coverage": {
-        "attribute_count": len(phase2_impact.get("attribute_results", [])),
-        "recipe_count_requested": len(recipes_requested),
-        "recipe_count_extracted": len(recipes_extracted),
-        "recipe_extraction_failure_count": len(unsupported_or_failed_recipes),
-        "analysis_row_count": len(analysis_rows)
-    },
-    "classification_counts": dict(classification_counts),
-    "summary_matrix": summary_matrix,
-    "analysis_rows": analysis_rows,
-    "recipe_extraction_failures": unsupported_or_failed_recipes,
-    "limitations": [
-        "Input/output schema comparison is dataset-level evidence.",
-        "String references do not prove semantic usage or propagation.",
-        "Visual recipe and plugin payload structures vary by Dataiku version.",
-        "PASSTHROUGH and DROPPED classifications require SME validation.",
-        "Aliases and complex dynamic code may remain UNKNOWN.",
-        "No LLM explanation is used in this Phase 3 version."
-    ]
 }
 
-
-###############################################################################
-# STEP 11 - BUILD THE SINGLE HUMAN-READABLE PHASE 3 ARTIFACT
-###############################################################################
-
-md = [
-    "# ARIS Transformation & Column-Lineage Analysis",
-    "",
-    f"**Project:** {aris_context['project']}",
-    f"**Generated:** {transformation_report['generated_at']}",
-    f"**ARIS Version:** {transformation_report['aris_version']}",
-    "",
-    "## Coverage",
-    "",
-    f"- Attributes analyzed: {transformation_report['coverage']['attribute_count']}",
-    f"- Recipes requested from Phase 2: {transformation_report['coverage']['recipe_count_requested']}",
-    f"- Recipe payloads extracted: {transformation_report['coverage']['recipe_count_extracted']}",
-    f"- Recipe extraction failures: {transformation_report['coverage']['recipe_extraction_failure_count']}",
-    f"- Attribute-recipe analyses: {transformation_report['coverage']['analysis_row_count']}",
-    "",
-    "## Column-Lineage Matrix",
-    "",
-    markdown_table(
-        summary_matrix,
-        [
-            "Attribute", "Recipe", "Type", "Input", "Output",
-            "Reference", "Classification", "Confidence"
-        ]
-    ),
-    "",
-    "## Classification Summary",
-    ""
-]
-
-classification_rows = [
-    {"Classification": classification, "Count": count}
-    for classification, count in sorted(classification_counts.items())
-]
-md.append(markdown_table(classification_rows, ["Classification", "Count"]))
-md.append("")
-md.append("## Detailed Evidence")
-md.append("")
-
-for row in analysis_rows:
-    md.extend([
-        f"### {row['attribute']} | {row['recipe'] or 'N/A'}",
-        "",
-        f"- **Recipe Type:** {row['recipe_type'] or 'N/A'}",
-        f"- **Classification:** {row['classification']}",
-        f"- **Confidence:** {row['confidence']}",
-        f"- **Input Schema Contains Attribute:** {'Yes' if row['input_present'] else 'No'}",
-        f"- **Output Schema Contains Attribute:** {'Yes' if row['output_present'] else 'No'}",
-        f"- **Recipe Content References Attribute:** {'Yes' if row['code_referenced'] else 'No'}",
-        f"- **Evidence Basis:** {row['evidence_basis']}",
-        f"- **Inputs:** {', '.join(row['inputs']) if row['inputs'] else 'None captured'}",
-        f"- **Outputs:** {', '.join(row['outputs']) if row['outputs'] else 'None captured'}",
-        ""
-    ])
-
-    if row["evidence"]:
-        md.append("**Recipe Evidence**")
-        md.append("")
-        for evidence_item in row["evidence"]:
-            md.append(f"- `{evidence_item['path']}`: {evidence_item['snippet']}")
-        md.append("")
-
-if unsupported_or_failed_recipes:
-    md.append("## Recipe Extraction Failures")
-    md.append("")
-    failure_rows = [
-        {
-            "Recipe": item.get("recipe"),
-            "Type": item.get("recipe_type"),
-            "Error": item.get("error")
-        }
-        for item in unsupported_or_failed_recipes
-    ]
-    md.append(markdown_table(failure_rows, ["Recipe", "Type", "Error"]))
-    md.append("")
-
-md.append("## Current Limitations")
-md.append("")
-for limitation in transformation_report["limitations"]:
-    md.append(f"- {limitation}")
-
-md.extend([
-    "",
-    "## Final Decision",
-    "",
-    "Phase 3 provides deterministic recipe-level evidence and a preliminary "
-    "column-behavior classification. UNKNOWN, low-confidence, PASSTHROUGH, and "
-    "DROPPED findings must be validated by a data engineer or SME before the "
-    "implementation scope is approved.",
-    ""
-])
-
-transformation_markdown = "\n".join(md)
-
-
-###############################################################################
-# STEP 12 - SAVE ONLY TWO PHASE 3 ARTIFACTS
-###############################################################################
-
-with open(JSON_OUTPUT_FILE, "w", encoding="utf-8") as output:
-    json.dump(
-        transformation_report,
-        output,
-        indent=4,
-        ensure_ascii=False,
-        default=str
-    )
-
-with open(MARKDOWN_OUTPUT_FILE, "w", encoding="utf-8") as output:
-    output.write(transformation_markdown)
-
-
-###############################################################################
-# STEP 13 - PRINT SUMMARY
-###############################################################################
-
-print()
-print("=" * 110)
-print("ARIS PHASE 3 TRANSFORMATION ANALYSIS COMPLETE")
-print("=" * 110)
-print(f"Project                   : {aris_context['project']}")
-print(f"Attributes analyzed       : {transformation_report['coverage']['attribute_count']}")
-print(f"Recipes requested         : {transformation_report['coverage']['recipe_count_requested']}")
-print(f"Recipe payloads extracted : {transformation_report['coverage']['recipe_count_extracted']}")
-print(f"Extraction failures       : {transformation_report['coverage']['recipe_extraction_failure_count']}")
-print()
-
-print("COLUMN-LINEAGE MATRIX")
-print("-" * 110)
-console_table(
-    summary_matrix,
-    [
-        "Attribute", "Recipe", "Type", "Input", "Output",
-        "Reference", "Classification", "Confidence"
-    ]
+save_json(
+    "ARIS_SUMMARY.json",
+    summary
 )
 
-print()
-print("Generated Artifacts")
-print("-" * 110)
-print(f"1. {JSON_OUTPUT_FILE}")
-print(f"2. {MARKDOWN_OUTPUT_FILE}")
+# ==========================================================================
+# LIST FILES
+# ==========================================================================
 
-print()
-print("IMPORTANT")
-print("-" * 110)
-print("No recipe was modified. This analysis is read-only.")
-print("Human validation is required before using classifications for implementation.")
+print("\n" + "=" * 80)
+print("FILES WRITTEN")
+print("=" * 80)
 
+try:
 
-# In[11]:
+    for f in Context_files.list_paths_in_partition():
 
+        print(" -", f)
 
-###############################################################################
-# ARIS PHASE 4 v1.0 - IMPLEMENTATION SCOPE GENERATOR
-#
-# PURPOSE
-# -------
-# Convert Phase 2 impact evidence and Phase 3 transformation intelligence into
-# an explainable, implementation-oriented work package for each requested
-# attribute.
-#
-# INPUTS
-# ------
-# 1. ARIS_IMPACT_ANALYSIS.json          (Phase 2)
-# 2. ARIS_TRANSFORMATION_ANALYSIS.json  (Phase 3)
-#
-# OUTPUTS (ONLY TWO)
-# ------------------
-# 1. ARIS_IMPLEMENTATION_SCOPE.json
-# 2. ARIS_IMPLEMENTATION_SCOPE.md
-#
-# IMPORTANT
-# ---------
-# This generator is deterministic and evidence-based. It does not modify
-# Dataiku recipes, Snowflake objects, dashboards, tickets, or documentation.
-# It creates a DRAFT implementation scope that requires SME and engineering
-# approval.
-###############################################################################
+except Exception as e:
 
-import json
-import os
-from collections import Counter, defaultdict
-from datetime import datetime
+    print(str(e))
 
+# ==========================================================================
+# COMPLETE
+# ==========================================================================
 
-###############################################################################
-# STEP 1 - CONFIGURATION
-###############################################################################
+print("\n" + "=" * 80)
+print("SCAN COMPLETE")
+print("=" * 80)
 
-PHASE_2_FILE = "ARIS_IMPACT_ANALYSIS.json"
-PHASE_3_FILE = "ARIS_TRANSFORMATION_ANALYSIS.json"
-
-JSON_OUTPUT_FILE = "ARIS_IMPLEMENTATION_SCOPE.json"
-MARKDOWN_OUTPUT_FILE = "ARIS_IMPLEMENTATION_SCOPE.md"
-
-
-###############################################################################
-# STEP 2 - HELPERS
-###############################################################################
-
-def load_json(path, label):
-    """Load and validate a required JSON input."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Could not find '{path}'. Run {label} before Phase 4."
-        )
-
-    with open(path, "r", encoding="utf-8") as source:
-        return json.load(source)
-
-
-def unique_dicts(records, fields):
-    """Deduplicate dictionaries using selected fields."""
-    seen = set()
-    output = []
-
-    for record in records:
-        key = tuple(record.get(field) for field in fields)
-        if key not in seen:
-            seen.add(key)
-            output.append(record)
-
-    return output
-
-
-def markdown_table(records, columns):
-    """Convert dictionaries into a Markdown table."""
-    if not records:
-        return "_No records found._"
-
-    lines = [
-        "| " + " | ".join(columns) + " |",
-        "| " + " | ".join(["---"] * len(columns)) + " |"
-    ]
-
-    for record in records:
-        cells = []
-        for column in columns:
-            value = record.get(column, "")
-            if value is None:
-                value = ""
-            value = str(value).replace("|", "\\|").replace("\n", " ")
-            cells.append(value)
-        lines.append("| " + " | ".join(cells) + " |")
-
-    return "\n".join(lines)
-
-
-def console_table(records, columns):
-    """Print a compact console matrix."""
-    if not records:
-        print("No records found.")
-        return
-
-    widths = {
-        column: max(
-            len(column),
-            max(len(str(record.get(column, ""))) for record in records)
-        )
-        for column in columns
-    }
-
-    header = " | ".join(column.ljust(widths[column]) for column in columns)
-    separator = "-+-".join("-" * widths[column] for column in columns)
-
-    print(header)
-    print(separator)
-
-    for record in records:
-        print(
-            " | ".join(
-                str(record.get(column, "")).ljust(widths[column])
-                for column in columns
-            )
-        )
-
-
-def work_status_for_classification(classification):
-    """Map Phase 3 classification to a practical engineering disposition."""
-    mapping = {
-        "PASSTHROUGH": "Validate Only",
-        "CREATED": "Validate Existing Logic",
-        "DROPPED": "Change Required",
-        "TRANSFORMED": "Review / Change May Be Required",
-        "JOIN_KEY": "Review Join Configuration",
-        "FILTER_OR_RULE": "Review Rule Configuration",
-        "REFERENCED": "Manual Review Required",
-        "UNKNOWN": "Manual Review Required",
-        "NOT_APPLICABLE": "Blocked / Clarification Required"
-    }
-    return mapping.get(classification, "Manual Review Required")
-
-
-def action_for_classification(classification, attribute, recipe_name):
-    """Generate a deterministic recipe-level action from Phase 3 evidence."""
-    recipe_text = recipe_name or "the relevant recipe"
-
-    actions = {
-        "PASSTHROUGH": (
-            f"Validate that {attribute} remains unchanged through {recipe_text}; "
-            "no recipe change is proposed unless testing identifies a gap."
-        ),
-        "CREATED": (
-            f"Validate the existing derivation of {attribute} in {recipe_text}, "
-            "including datatype, business rule, null handling, and output meaning."
-        ),
-        "DROPPED": (
-            f"Update {recipe_text} to retain or map {attribute} into the required "
-            "output, then refresh the output schema."
-        ),
-        "TRANSFORMED": (
-            f"Review how {recipe_text} transforms {attribute}; confirm whether the "
-            "existing business rule satisfies the request or requires modification."
-        ),
-        "JOIN_KEY": (
-            f"Review the join configuration in {recipe_text}; confirm join side, key "
-            f"mapping, duplicate behavior, and whether {attribute} must be selected "
-            "into the output."
-        ),
-        "FILTER_OR_RULE": (
-            f"Review the filter or rule involving {attribute} in {recipe_text}; "
-            "confirm whether the attribute must also be propagated downstream."
-        ),
-        "REFERENCED": (
-            f"Inspect the reference to {attribute} in {recipe_text} and determine "
-            "whether it is selected, renamed, filtered, transformed, or discarded."
-        ),
-        "UNKNOWN": (
-            f"Manually inspect {recipe_text} because ARIS could not determine how "
-            f"{attribute} behaves."
-        ),
-        "NOT_APPLICABLE": (
-            f"Do not change recipes for {attribute} until its source and business "
-            "definition are confirmed."
-        )
-    }
-
-    return actions.get(
-        classification,
-        f"Manually review {recipe_text} for {attribute}."
-    )
-
-
-def priority_for_row(classification, confidence):
-    """Assign review priority, not implementation severity."""
-    if classification in {"DROPPED", "UNKNOWN", "NOT_APPLICABLE"}:
-        return "High"
-    if confidence == "Low" or classification in {
-        "TRANSFORMED", "JOIN_KEY", "FILTER_OR_RULE", "REFERENCED"
-    }:
-        return "Medium"
-    return "Low"
-
-
-def approval_for_classification(classification):
-    """Identify the recommended approval role."""
-    if classification == "NOT_APPLICABLE":
-        return "Business SME + Data Owner"
-    if classification in {"CREATED", "TRANSFORMED", "FILTER_OR_RULE"}:
-        return "Business SME + Data Engineer"
-    if classification in {"JOIN_KEY", "DROPPED", "UNKNOWN", "REFERENCED"}:
-        return "Data Engineer + SME"
-    return "Data Engineer"
-
-
-###############################################################################
-# STEP 3 - LOAD AND VALIDATE PHASE 2 AND PHASE 3
-###############################################################################
-
-phase2 = load_json(PHASE_2_FILE, "Phase 2")
-phase3 = load_json(PHASE_3_FILE, "Phase 3")
-
-required_phase2_keys = {"project", "attribute_results", "overall_assessment"}
-required_phase3_keys = {"project", "analysis_rows", "coverage"}
-
-missing_phase2 = required_phase2_keys.difference(phase2.keys())
-missing_phase3 = required_phase3_keys.difference(phase3.keys())
-
-if missing_phase2:
-    raise ValueError(
-        "Phase 2 artifact is incomplete. Missing keys: "
-        + ", ".join(sorted(missing_phase2))
-    )
-
-if missing_phase3:
-    raise ValueError(
-        "Phase 3 artifact is incomplete. Missing keys: "
-        + ", ".join(sorted(missing_phase3))
-    )
-
-if phase2["project"] != phase3["project"]:
-    raise ValueError(
-        "Phase 2 and Phase 3 project keys do not match. "
-        f"Phase 2: {phase2['project']} | Phase 3: {phase3['project']}"
-    )
-
-print("=" * 90)
-print("ARIS PHASE 4 - IMPLEMENTATION SCOPE GENERATOR")
-print("=" * 90)
-print(f"Project       : {phase2['project']}")
-print(f"Phase 2 Input : {PHASE_2_FILE}")
-print(f"Phase 3 Input : {PHASE_3_FILE}")
-print()
-
-
-###############################################################################
-# STEP 4 - BUILD LOOKUPS
-###############################################################################
-
-phase2_by_attribute = {
-    result.get("attribute"): result
-    for result in phase2["attribute_results"]
-    if result.get("attribute")
-}
-
-phase3_by_attribute = defaultdict(list)
-for row in phase3["analysis_rows"]:
-    attribute = row.get("attribute")
-    if attribute:
-        phase3_by_attribute[attribute].append(row)
-
-
-###############################################################################
-# STEP 5 - BUILD ATTRIBUTE-LEVEL IMPLEMENTATION SCOPES
-###############################################################################
-
-attribute_scopes = []
-work_items = []
-test_items = []
-approval_items = []
-
-for attribute, phase2_result in phase2_by_attribute.items():
-    feasibility = phase2_result.get("feasibility", "Not Confirmed")
-    phase3_rows = phase3_by_attribute.get(attribute, [])
-
-    classifications = Counter(
-        row.get("classification", "UNKNOWN")
-        for row in phase3_rows
-    )
-
-    candidate_datasets = [
-        item.get("dataset")
-        for item in phase2_result.get("candidate_analyses", [])
-        if item.get("dataset")
-    ]
-
-    impacted_datasets = phase2_result.get("impacted_datasets", []) or []
-    impacted_recipes = phase2_result.get("impacted_recipes", []) or []
-
-    blockers = []
-    assumptions = []
-
-    if feasibility == "Not Confirmed":
-        scope_status = "Blocked"
-        readiness = "Not Ready"
-        blockers.append(
-            "Requested attribute was not found in captured project schemas."
-        )
-    elif any(
-        row.get("classification") in {"UNKNOWN", "NOT_APPLICABLE"}
-        for row in phase3_rows
-    ):
-        scope_status = "Needs Investigation"
-        readiness = "Not Ready"
-        blockers.append(
-            "At least one recipe has insufficient transformation evidence."
-        )
-    elif any(
-        row.get("classification") == "DROPPED"
-        for row in phase3_rows
-    ):
-        scope_status = "Change Required"
-        readiness = "Ready for Engineering Review"
-    else:
-        scope_status = "Validation Required"
-        readiness = "Ready for SME Review"
-
-    if not phase3_rows:
-        blockers.append("No Phase 3 recipe analysis was available for this attribute.")
-
-    assumptions.extend([
-        "Phase 1 dataset schemas are current.",
-        "Phase 2 dataset-level lineage captures the relevant Dataiku flow.",
-        "External consumers outside Dataiku require separate confirmation."
-    ])
-
-    # Recipe-level work items
-    for row in phase3_rows:
-        classification = row.get("classification", "UNKNOWN")
-        recipe_name = row.get("recipe")
-        confidence = row.get("confidence", "Low")
-
-        if classification == "NOT_APPLICABLE":
-            continue
-
-        work_items.append({
-            "work_item_id": f"{attribute}-RECIPE-{len(work_items) + 1:03d}",
-            "attribute": attribute,
-            "layer": "Transformation",
-            "asset": recipe_name or "N/A",
-            "asset_type": row.get("recipe_type") or "N/A",
-            "classification": classification,
-            "action": action_for_classification(
-                classification,
-                attribute,
-                recipe_name
-            ),
-            "priority": priority_for_row(classification, confidence),
-            "confidence": confidence,
-            "approval": approval_for_classification(classification),
-            "evidence_basis": row.get("evidence_basis"),
-            "status": work_status_for_classification(classification)
-        })
-
-    # Source and schema work items
-    if feasibility == "Not Confirmed":
-        work_items.append({
-            "work_item_id": f"{attribute}-DISCOVERY-001",
-            "attribute": attribute,
-            "layer": "Source Discovery",
-            "asset": "Upstream systems / adjacent projects",
-            "asset_type": "Discovery",
-            "classification": "NOT_APPLICABLE",
-            "action": (
-                f"Confirm the business definition, synonyms, datatype, grain, "
-                f"sample values, and authoritative source for {attribute}."
-            ),
-            "priority": "High",
-            "confidence": "Low",
-            "approval": "Business SME + Data Owner",
-            "evidence_basis": phase2_result.get("feasibility_basis"),
-            "status": "Blocked / Clarification Required"
-        })
-    else:
-        for dataset_name in candidate_datasets:
-            work_items.append({
-                "work_item_id": f"{attribute}-SOURCE-{len(work_items) + 1:03d}",
-                "attribute": attribute,
-                "layer": "Source",
-                "asset": dataset_name,
-                "asset_type": "Dataset",
-                "classification": "SOURCE_CANDIDATE",
-                "action": (
-                    f"Validate that {dataset_name} is an approved source for "
-                    f"{attribute}, including business meaning, datatype, nullability, "
-                    "historical coverage, and permitted use."
-                ),
-                "priority": "Medium",
-                "confidence": phase2_result.get("confidence", "Medium"),
-                "approval": "Data Owner + Business SME",
-                "evidence_basis": "Candidate dataset identified by Phase 2.",
-                "status": "Validation Required"
-            })
-
-        for dataset_name in impacted_datasets:
-            work_items.append({
-                "work_item_id": f"{attribute}-SCHEMA-{len(work_items) + 1:03d}",
-                "attribute": attribute,
-                "layer": "Dataset Schema",
-                "asset": dataset_name,
-                "asset_type": "Dataset",
-                "classification": "SCHEMA_IMPACT",
-                "action": (
-                    f"Confirm whether {attribute} must be exposed in {dataset_name}; "
-                    "refresh the output schema only after recipe-level validation."
-                ),
-                "priority": "Medium",
-                "confidence": phase2_result.get("confidence", "Medium"),
-                "approval": "Data Engineer + Consumer",
-                "evidence_basis": "Downstream dataset identified by Phase 2 lineage.",
-                "status": "Review Required"
-            })
-
-    # Test scope
-    if feasibility != "Not Confirmed":
-        standard_tests = [
-            ("Schema", f"Verify {attribute} exists in approved output schemas with the expected datatype."),
-            ("Completeness", f"Validate null rate and population coverage for {attribute}."),
-            ("Regression", f"Confirm existing row counts and key metrics are unchanged after propagating {attribute}."),
-            ("Lineage", f"Validate {attribute} across each approved source-to-output path."),
-            ("Consumer", f"Confirm downstream consumers can read {attribute} without breaking existing contracts.")
-        ]
-
-        for test_type, description in standard_tests:
-            test_items.append({
-                "test_id": f"{attribute}-TEST-{len(test_items) + 1:03d}",
-                "attribute": attribute,
-                "test_type": test_type,
-                "description": description,
-                "owner": "Engineering / QA",
-                "required": True
-            })
-
-    # Approval checklist
-    approvals = [
-        ("Business Definition", "Business SME"),
-        ("Source and Permitted Use", "Data Owner"),
-        ("Transformation Design", "Data Engineer / Tech Lead"),
-        ("Downstream Consumer Impact", "Product Owner / Consumer"),
-        ("Test Evidence", "Engineering / QA")
-    ]
-
-    for approval_name, approver in approvals:
-        approval_items.append({
-            "attribute": attribute,
-            "approval": approval_name,
-            "approver": approver,
-            "status": "Pending"
-        })
-
-    attribute_scopes.append({
-        "attribute": attribute,
-        "feasibility": feasibility,
-        "confidence": phase2_result.get("confidence"),
-        "complexity": phase2_result.get("complexity"),
-        "metadata_risk": phase2_result.get("risk"),
-        "scope_status": scope_status,
-        "readiness": readiness,
-        "candidate_datasets": sorted(set(candidate_datasets)),
-        "impacted_recipes": sorted(set(impacted_recipes)),
-        "impacted_datasets": sorted(set(impacted_datasets)),
-        "classification_counts": dict(classifications),
-        "blockers": blockers,
-        "assumptions": assumptions
-    })
-
-
-###############################################################################
-# STEP 6 - DEDUPLICATE WORK PACKAGE ITEMS
-###############################################################################
-
-work_items = unique_dicts(
-    work_items,
-    ["attribute", "layer", "asset", "classification", "action"]
-)
-test_items = unique_dicts(
-    test_items,
-    ["attribute", "test_type", "description"]
-)
-approval_items = unique_dicts(
-    approval_items,
-    ["attribute", "approval", "approver"]
-)
-
-# Re-number after deduplication for stable human-readable IDs.
-for index, item in enumerate(work_items, start=1):
-    item["work_item_id"] = f"ARIS-WI-{index:03d}"
-
-for index, item in enumerate(test_items, start=1):
-    item["test_id"] = f"ARIS-TEST-{index:03d}"
-
-
-###############################################################################
-# STEP 7 - OVERALL READINESS
-###############################################################################
-
-if any(scope["readiness"] == "Not Ready" for scope in attribute_scopes):
-    overall_readiness = "Not Ready - Clarification or Investigation Required"
-elif any(
-    scope["readiness"] == "Ready for Engineering Review"
-    for scope in attribute_scopes
-):
-    overall_readiness = "Ready for Engineering Review"
-else:
-    overall_readiness = "Ready for SME Review"
-
-high_priority_work_items = sum(
-    1 for item in work_items if item.get("priority") == "High"
-)
-manual_review_items = sum(
-    1 for item in work_items
-    if item.get("status") in {
-        "Manual Review Required",
-        "Blocked / Clarification Required"
-    }
-)
-
-
-###############################################################################
-# STEP 8 - BUILD THE SINGLE MACHINE-READABLE PHASE 4 ARTIFACT
-###############################################################################
-
-scope_report = {
-    "aris_version": "4.0-poc",
-    "analysis_type": "implementation_scope_generation",
-    "generated_at": datetime.now().isoformat(timespec="seconds"),
-    "project": phase2["project"],
-    "change_request": phase2.get("change_request"),
-    "search_terms": phase2.get("search_terms", []),
-    "inputs": {
-        "phase_2": PHASE_2_FILE,
-        "phase_3": PHASE_3_FILE
-    },
-    "analysis_contract": {
-        "scope_is_draft": True,
-        "systems_modified": False,
-        "tickets_created": False,
-        "effort_estimated": False,
-        "human_approval_required": True
-    },
-    "overall_summary": {
-        "readiness": overall_readiness,
-        "attribute_count": len(attribute_scopes),
-        "work_item_count": len(work_items),
-        "test_item_count": len(test_items),
-        "approval_item_count": len(approval_items),
-        "high_priority_work_item_count": high_priority_work_items,
-        "manual_review_item_count": manual_review_items
-    },
-    "attribute_scopes": attribute_scopes,
-    "work_items": work_items,
-    "test_plan": test_items,
-    "approval_checklist": approval_items,
-    "limitations": [
-        "This is a draft scope generated from Phase 2 and Phase 3 evidence.",
-        "No recipe, dataset, Snowflake object, dashboard, or ticket was modified.",
-        "No effort, cost, duration, or resource estimate is produced.",
-        "External consumers and cross-project dependencies require validation.",
-        "UNKNOWN and low-confidence Phase 3 findings require manual review.",
-        "Implementation requires business, data-owner, engineering, and consumer approvals."
-    ]
-}
-
-
-###############################################################################
-# STEP 9 - BUILD THE SINGLE HUMAN-READABLE PHASE 4 ARTIFACT
-###############################################################################
-
-attribute_summary_matrix = []
-for scope in attribute_scopes:
-    attribute_summary_matrix.append({
-        "Attribute": scope["attribute"],
-        "Feasibility": scope["feasibility"],
-        "Confidence": scope["confidence"],
-        "Complexity": scope["complexity"],
-        "Metadata Risk": scope["metadata_risk"],
-        "Scope Status": scope["scope_status"],
-        "Readiness": scope["readiness"],
-        "Recipes": len(scope["impacted_recipes"]),
-        "Datasets": len(scope["impacted_datasets"])
-    })
-
-work_item_matrix = []
-for item in work_items:
-    work_item_matrix.append({
-        "ID": item["work_item_id"],
-        "Attribute": item["attribute"],
-        "Layer": item["layer"],
-        "Asset": item["asset"],
-        "Action": item["action"],
-        "Priority": item["priority"],
-        "Status": item["status"],
-        "Approval": item["approval"]
-    })
-
-test_matrix = []
-for item in test_items:
-    test_matrix.append({
-        "ID": item["test_id"],
-        "Attribute": item["attribute"],
-        "Test Type": item["test_type"],
-        "Description": item["description"],
-        "Owner": item["owner"]
-    })
-
-approval_matrix = []
-for item in approval_items:
-    approval_matrix.append({
-        "Attribute": item["attribute"],
-        "Approval": item["approval"],
-        "Approver": item["approver"],
-        "Status": item["status"]
-    })
-
-md = [
-    "# ARIS Implementation Scope",
-    "",
-    f"**Project:** {scope_report['project']}",
-    f"**Generated:** {scope_report['generated_at']}",
-    f"**ARIS Version:** {scope_report['aris_version']}",
-    "",
-    "## Change Request",
-    "",
-    scope_report.get("change_request") or "_No request text captured._",
-    "",
-    "## Overall Readiness",
-    "",
-    f"- **Readiness:** {overall_readiness}",
-    f"- **Attributes:** {len(attribute_scopes)}",
-    f"- **Draft Work Items:** {len(work_items)}",
-    f"- **Required Tests:** {len(test_items)}",
-    f"- **Required Approvals:** {len(approval_items)}",
-    f"- **High-Priority Reviews:** {high_priority_work_items}",
-    f"- **Manual Review / Blocked Items:** {manual_review_items}",
-    "",
-    "## Attribute Scope Summary",
-    "",
-    markdown_table(
-        attribute_summary_matrix,
-        [
-            "Attribute", "Feasibility", "Confidence", "Complexity",
-            "Metadata Risk", "Scope Status", "Readiness", "Recipes", "Datasets"
-        ]
-    ),
-    "",
-    "## Draft Engineering Work Package",
-    "",
-    markdown_table(
-        work_item_matrix,
-        [
-            "ID", "Attribute", "Layer", "Asset", "Action",
-            "Priority", "Status", "Approval"
-        ]
-    ),
-    "",
-    "## Test Plan",
-    "",
-    markdown_table(
-        test_matrix,
-        ["ID", "Attribute", "Test Type", "Description", "Owner"]
-    ),
-    "",
-    "## Approval Checklist",
-    "",
-    markdown_table(
-        approval_matrix,
-        ["Attribute", "Approval", "Approver", "Status"]
-    ),
-    "",
-    "## Attribute-Level Details",
-    ""
-]
-
-for scope in attribute_scopes:
-    md.extend([
-        f"### {scope['attribute']}",
-        "",
-        f"- **Feasibility:** {scope['feasibility']}",
-        f"- **Confidence:** {scope['confidence']}",
-        f"- **Complexity:** {scope['complexity']}",
-        f"- **Metadata Risk:** {scope['metadata_risk']}",
-        f"- **Scope Status:** {scope['scope_status']}",
-        f"- **Readiness:** {scope['readiness']}",
-        f"- **Candidate Datasets:** {', '.join(scope['candidate_datasets']) or 'None'}",
-        f"- **Impacted Recipes:** {', '.join(scope['impacted_recipes']) or 'None'}",
-        f"- **Impacted Datasets:** {', '.join(scope['impacted_datasets']) or 'None'}",
-        ""
-    ])
-
-    if scope["blockers"]:
-        md.append("**Blockers**")
-        md.append("")
-        for blocker in scope["blockers"]:
-            md.append(f"- {blocker}")
-        md.append("")
-
-    md.append("**Assumptions**")
-    md.append("")
-    for assumption in scope["assumptions"]:
-        md.append(f"- {assumption}")
-    md.append("")
-
-md.append("## Current Limitations")
-md.append("")
-for limitation in scope_report["limitations"]:
-    md.append(f"- {limitation}")
-
-md.extend([
-    "",
-    "## Final Decision",
-    "",
-    "This document is an implementation-ready draft, not an approved delivery "
-    "commitment. The work package, tests, blockers, assumptions, and approvals "
-    "must be reviewed before development begins.",
-    ""
-])
-
-scope_markdown = "\n".join(md)
-
-
-###############################################################################
-# STEP 10 - SAVE ONLY TWO PHASE 4 ARTIFACTS
-###############################################################################
-
-with open(JSON_OUTPUT_FILE, "w", encoding="utf-8") as output:
-    json.dump(
-        scope_report,
-        output,
-        indent=4,
-        ensure_ascii=False,
-        default=str
-    )
-
-with open(MARKDOWN_OUTPUT_FILE, "w", encoding="utf-8") as output:
-    output.write(scope_markdown)
-
-
-###############################################################################
-# STEP 11 - PRINT SUMMARY
-###############################################################################
-
-print()
-print("=" * 110)
-print("ARIS PHASE 4 IMPLEMENTATION SCOPE COMPLETE")
-print("=" * 110)
-print(f"Project                  : {scope_report['project']}")
-print(f"Overall Readiness        : {overall_readiness}")
-print(f"Attributes               : {len(attribute_scopes)}")
-print(f"Draft Work Items         : {len(work_items)}")
-print(f"Required Tests           : {len(test_items)}")
-print(f"Required Approvals       : {len(approval_items)}")
-print(f"High-Priority Reviews    : {high_priority_work_items}")
-print(f"Manual Review / Blockers : {manual_review_items}")
-print()
-
-print("ATTRIBUTE SCOPE SUMMARY")
-print("-" * 110)
-console_table(
-    attribute_summary_matrix,
-    [
-        "Attribute", "Feasibility", "Confidence", "Complexity",
-        "Metadata Risk", "Scope Status", "Readiness", "Recipes", "Datasets"
-    ]
-)
-
-print()
-print("Generated Artifacts")
-print("-" * 110)
-print(f"1. {JSON_OUTPUT_FILE}")
-print(f"2. {MARKDOWN_OUTPUT_FILE}")
-
-print()
-print("IMPORTANT")
-print("-" * 110)
-print("No Dataiku, Snowflake, dashboard, ticket, or documentation object was modified.")
-print("Human review and approval are required before development begins.")
+print(json.dumps(summary, indent=2))
