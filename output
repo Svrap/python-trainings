@@ -1,0 +1,41 @@
+
+Scanning 63 recipes...
+  [63/63] compute_test_dataset (python)query)y)ormed (sql_query)))
+✅ Recipes scanned: 63 | ⚠️ Errors: 0
+
+Scanning 68 datasets...
+  [68/68] test_datasetcidnedSSET_Transformedinedyyy
+✅ Datasets scanned: 68 | ⚠️ Errors: 0
+
+Saving outputs to managed folder...
+  ✅ Saved: ARIS_PROJECT_GRAPH.json
+  ✅ Saved: ARIS_RECIPE_INTELLIGENCE.json
+  ✅ Saved: ARIS_DATASET_REGISTRY.json
+  ✅ Saved: ARIS_SUMMARY.json
+
+
+================================================================================
+ARIS Phase 1 Complete — Project Intelligence
+================================================================================
+Project              : JEM_HQE
+Completed            : 2026-08-30 18:24:04
+
+Scan Results:
+  Recipes scanned    : 63
+  Datasets scanned   : 68
+  Edges captured     : 158
+
+Recipe Type Breakdown:
+  sql_query            : 38
+  join                 : 20
+  python               : 5
+
+Output Files (in managed folder 'project_context'):
+  ✅ ARIS_PROJECT_GRAPH.json
+  ✅ ARIS_RECIPE_INTELLIGENCE.json
+  ✅ ARIS_DATASET_REGISTRY.json
+  ✅ ARIS_SUMMARY.json
+
+Next Step:
+  Run ARIS Phase 2 — Impact Analysis
+================================================================================
