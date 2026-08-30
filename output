@@ -39,3 +39,14 @@ Output Files (in managed folder 'project_context'):
 Next Step:
   Run ARIS Phase 2 — Impact Analysis
 ================================================================================
+
+
+
+print(f"  [{index + 1}/{total_recipes}] {recipe_name} ({recipe_type})", end="\r")
+
+print(f"  [{index + 1}/{total_recipes}] {recipe_name[:50]:<50}", end="\r")
+
+
+print(f"  [{index + 1}/{total_datasets}] {dataset_name}", end="\r")
+
+print(f"  [{index + 1}/{total_datasets}] {dataset_name[:50]:<50}", end="\r")
