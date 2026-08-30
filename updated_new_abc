@@ -1,0 +1,366 @@
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# -*- coding: utf-8 -*-
+import dataiku
+import pandas as pd, numpy as np
+from dataiku import pandasutils as pdu
+import json
+from datetime import datetime
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# AUTO DISCOVER PROJECT_CONTEXT MANAGED FOLDER
+# ==========================================================================
+PROJECT_KEY = dataiku.default_project_key()
+
+client = dataiku.api_client()
+project = client.get_project(PROJECT_KEY)
+
+PROJECT_CONTEXT_FOLDER_ID = None
+
+for folder in project.list_managed_folders():
+    try:
+        if folder["name"].lower() == "project_context":
+            PROJECT_CONTEXT_FOLDER_ID = folder["id"]
+            break
+    except:
+        pass
+
+if PROJECT_CONTEXT_FOLDER_ID is None:
+    raise Exception(
+        "Managed Folder 'project_context' was not found. "
+        "Please create a managed folder named exactly 'project_context'."
+    )
+
+Context_files = dataiku.Folder(PROJECT_CONTEXT_FOLDER_ID)
+
+print("=" * 80)
+print("PROJECT :", PROJECT_KEY)
+print("CONTEXT FOLDER :", PROJECT_CONTEXT_FOLDER_ID)
+print("=" * 80)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# # ==========================================================================
+# # CONFIG
+# # ==========================================================================
+
+# PROJECT_KEY = dataiku.default_project_key()
+
+# # ==========================================================================
+# # INIT
+# # ==========================================================================
+
+# client = dataiku.api_client()
+# project = client.get_project(PROJECT_KEY)
+
+# ==========================================================================
+# OUTPUT STRUCTURES
+# ==========================================================================
+
+project_scan = {
+    "project": PROJECT_KEY,
+    "scan_timestamp": str(datetime.now()),
+    "recipes": [],
+    "datasets": [],
+    "edges": []
+}
+
+recipe_intelligence = []
+
+dataset_registry = {}
+
+# ==========================================================================
+# RECIPES
+# ==========================================================================
+
+recipes = project.list_recipes()
+
+print("=" * 80)
+print("PHASE 1 + PHASE 2 SCAN")
+print("=" * 80)
+
+for recipe_info in recipes:
+
+    recipe_name = recipe_info["name"]
+    recipe_type = recipe_info.get("type")
+
+    print(f"Scanning Recipe: {recipe_name}")
+
+    recipe_obj = project.get_recipe(recipe_name)
+    settings = recipe_obj.get_settings()
+
+    # ========================================================
+    # INPUTS
+    # ========================================================
+
+    try:
+        inputs = settings.get_recipe_inputs()
+    except:
+        inputs = {}
+
+    # ========================================================
+    # OUTPUTS
+    # ========================================================
+
+    try:
+        outputs = settings.get_recipe_outputs()
+    except:
+        outputs = {}
+
+    # ========================================================
+    # FLOW GRAPH
+    # ========================================================
+
+    project_scan["recipes"].append({
+        "name": recipe_name,
+        "type": recipe_type
+    })
+
+    try:
+
+        for role, vals in inputs.items():
+
+            for item in vals:
+
+                ds = item.get("ref")
+
+                if ds:
+
+                    project_scan["edges"].append({
+                        "source": ds,
+                        "target": recipe_name,
+                        "relationship": "INPUT"
+                    })
+
+    except:
+        pass
+
+    try:
+
+        for role, vals in outputs.items():
+
+            for item in vals:
+
+                ds = item.get("ref")
+
+                if ds:
+
+                    project_scan["edges"].append({
+                        "source": recipe_name,
+                        "target": ds,
+                        "relationship": "OUTPUT"
+                    })
+
+    except:
+        pass
+
+    # ========================================================
+    # RAW DEFINITION
+    # ========================================================
+
+    try:
+        raw_definition = settings.get_recipe_raw_definition()
+    except:
+        raw_definition = {}
+
+    # ========================================================
+    # PARAMETERS
+    # ========================================================
+
+    try:
+        params = settings.get_recipe_params()
+    except:
+        params = {}
+
+    # ========================================================
+    # PAYLOAD
+    # ========================================================
+
+    try:
+        payload = settings.get_payload()
+    except:
+        payload = None
+
+    # ========================================================
+    # JSON PAYLOAD
+    # ========================================================
+
+    try:
+        json_payload = settings.get_json_payload()
+    except:
+        json_payload = None
+
+    # ========================================================
+    # GENERATED SQL
+    # ========================================================
+
+    generated_sql = None
+
+    try:
+
+        status = recipe_obj.get_status()
+
+        if hasattr(status, "data"):
+
+            if isinstance(status.data, dict):
+
+                generated_sql = status.data.get("sql")
+
+    except:
+        pass
+
+    # ========================================================
+    # JOINS
+    # ========================================================
+
+    joins = []
+
+    if hasattr(settings, "raw_joins"):
+
+        try:
+            joins = settings.raw_joins
+        except:
+            pass
+
+    # ========================================================
+    # CODE RECIPES
+    # ========================================================
+
+    recipe_code = None
+
+    if hasattr(settings, "get_code"):
+
+        try:
+            recipe_code = settings.get_code()
+        except:
+            pass
+
+    # ========================================================
+    # STORE INTELLIGENCE
+    # ========================================================
+
+    recipe_intelligence.append({
+        "recipe_name": recipe_name,
+        "recipe_type": recipe_type,
+        "settings_class": type(settings).__name__,
+        "inputs": inputs,
+        "outputs": outputs,
+        "joins": joins,
+        "params": params,
+        "generated_sql": generated_sql,
+        "raw_definition": raw_definition,
+        "payload": payload,
+        "json_payload": json_payload,
+        "code": recipe_code
+    })
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+
+# ==========================================================================
+# DATASETS
+# ==========================================================================
+
+print("\nScanning Datasets...")
+
+for dataset_info in project.list_datasets():
+
+    dataset_name = dataset_info["name"]
+
+    print(f"Dataset: {dataset_name}")
+
+    try:
+
+        dataset = project.get_dataset(dataset_name)
+
+        try:
+            schema = dataset.get_schema()
+        except:
+            schema = {}
+
+        try:
+            settings = dataset.get_settings().get_raw()
+        except:
+            settings = {}
+
+        dataset_registry[dataset_name] = {
+            "schema": schema,
+            "settings": settings
+        }
+
+        project_scan["datasets"].append({
+            "name": dataset_name
+        })
+
+    except Exception as e:
+
+        dataset_registry[dataset_name] = {
+            "error": str(e)
+        }
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# SAVE TO MANAGED FOLDER
+# ==========================================================================
+
+def write_json_to_folder(folder, filename, payload):
+    with folder.get_writer(filename) as writer:
+        writer.write(
+            json.dumps(
+                payload,
+                indent=2,
+                default=str
+            ).encode("utf-8")
+        )
+
+write_json_to_folder(
+    Context_files,
+    "ARIS_PROJECT_GRAPH.json",
+    project_scan
+)
+
+write_json_to_folder(
+    Context_files,
+    "ARIS_RECIPE_INTELLIGENCE.json",
+    recipe_intelligence
+)
+
+write_json_to_folder(
+    Context_files,
+    "ARIS_DATASET_REGISTRY.json",
+    dataset_registry
+)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# SUMMARY
+# ==========================================================================
+
+recipe_type_counter = {}
+
+for r in recipe_intelligence:
+
+    typ = r.get("recipe_type", "UNKNOWN")
+
+    recipe_type_counter[typ] = (
+        recipe_type_counter.get(typ, 0) + 1
+    )
+
+summary = {
+    "project": PROJECT_KEY,
+    "scan_timestamp": str(datetime.now()),
+    "recipes": len(project_scan["recipes"]),
+    "datasets": len(project_scan["datasets"]),
+    "edges": len(project_scan["edges"]),
+    "recipe_types": recipe_type_counter,
+    "output_files": [
+        "ARIS_PROJECT_GRAPH.json",
+        "ARIS_RECIPE_INTELLIGENCE.json",
+        "ARIS_DATASET_REGISTRY.json",
+        "ARIS_SUMMARY.json"
+    ]
+}
+
+write_json_to_folder(
+    Context_files,
+    "ARIS_SUMMARY.json",
+    summary
+)
