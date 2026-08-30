@@ -1,20 +1,49 @@
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
 # -*- coding: utf-8 -*-
+# ==========================================================================
+# ARIS - Automated Recipe Intelligence System
+# AI for Request Impact and Scope
+#
+# PHASE 1 - PROJECT INTELLIGENCE
+# Purpose: Scan a Dataiku project and build the knowledge base
+#          that all downstream phases depend on.
+#
+# HOW TO USE
+# ----------
+# 1. Create a Managed Folder named exactly "project_context" in this project
+# 2. Run all cells in order
+# 3. Outputs are saved to the managed folder automatically
+#
+# OUTPUTS
+# -------
+# ARIS_PROJECT_GRAPH.json      - flow graph (edges, recipes, datasets)
+# ARIS_RECIPE_INTELLIGENCE.json - rich recipe details including code
+# ARIS_DATASET_REGISTRY.json   - dataset schemas with column lists
+# ARIS_SUMMARY.json            - execution summary with metadata
+#
+# PREREQUISITES
+# -------------
+# None - this is the first phase. Run this before any other phase.
+#
+# VERSION
+# -------
+# ARIS v1.0 | Phase 1 - Project Intelligence
+# ==========================================================================
+
 import dataiku
-import pandas as pd, numpy as np
-from dataiku import pandasutils as pdu
 import json
 from datetime import datetime
 
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
 # ==========================================================================
-# AUTO DISCOVER PROJECT_CONTEXT MANAGED FOLDER
+# STEP 1 - CONNECT AND LOCATE MANAGED FOLDER
 # ==========================================================================
-PROJECT_KEY = dataiku.default_project_key()
 
+PROJECT_KEY = dataiku.default_project_key()
 client = dataiku.api_client()
 project = client.get_project(PROJECT_KEY)
 
+# Auto-discover the managed folder named "project_context"
 PROJECT_CONTEXT_FOLDER_ID = None
 
 for folder in project.list_managed_folders():
@@ -22,228 +51,238 @@ for folder in project.list_managed_folders():
         if folder["name"].lower() == "project_context":
             PROJECT_CONTEXT_FOLDER_ID = folder["id"]
             break
-    except:
+    except Exception:
         pass
 
 if PROJECT_CONTEXT_FOLDER_ID is None:
     raise Exception(
-        "Managed Folder 'project_context' was not found. "
+        "Managed Folder 'project_context' not found. "
         "Please create a managed folder named exactly 'project_context'."
     )
 
 Context_files = dataiku.Folder(PROJECT_CONTEXT_FOLDER_ID)
 
 print("=" * 80)
-print("PROJECT :", PROJECT_KEY)
-print("CONTEXT FOLDER :", PROJECT_CONTEXT_FOLDER_ID)
+print("ARIS v1.0 | Phase 1 — Project Intelligence")
+print("=" * 80)
+print(f"Project        : {PROJECT_KEY}")
+print(f"Context Folder : {PROJECT_CONTEXT_FOLDER_ID}")
+print(f"Started        : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 print("=" * 80)
 
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
-# # ==========================================================================
-# # CONFIG
-# # ==========================================================================
-
-# PROJECT_KEY = dataiku.default_project_key()
-
-# # ==========================================================================
-# # INIT
-# # ==========================================================================
-
-# client = dataiku.api_client()
-# project = client.get_project(PROJECT_KEY)
-
 # ==========================================================================
-# OUTPUT STRUCTURES
+# STEP 2 - INITIALISE OUTPUT STRUCTURES
 # ==========================================================================
+
+# Metadata added to every output file so downstream phases can
+# detect stale context and know which project it belongs to.
+ARIS_METADATA = {
+    "aris_version": "1.0",
+    "phase": "Phase 1 - Project Intelligence",
+    "project": PROJECT_KEY,
+    "generated_at": datetime.now().isoformat(timespec="seconds"),
+    "stale_after_days": 7
+}
 
 project_scan = {
-    "project": PROJECT_KEY,
-    "scan_timestamp": str(datetime.now()),
+    **ARIS_METADATA,
     "recipes": [],
     "datasets": [],
     "edges": []
 }
 
-recipe_intelligence = []
+recipe_intelligence = {
+    **ARIS_METADATA,
+    "recipes": []
+}
 
-dataset_registry = {}
+dataset_registry = {
+    **ARIS_METADATA,
+    "datasets": {}
+}
 
+# Counters for execution summary
+recipe_success = 0
+recipe_errors = 0
+dataset_success = 0
+dataset_errors = 0
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
 # ==========================================================================
-# RECIPES
+# STEP 3 - SCAN RECIPES
+#
+# For each recipe we capture:
+# - name and type
+# - input and output datasets
+# - flow graph edges
+# - raw definition and parameters
+# - payload (SQL query, Join config, Python code etc.)
+# - generated SQL (if available from recipe status)
+# - join configuration (for join recipes)
+# - actual code (for Python, PySpark, R recipes)
 # ==========================================================================
 
 recipes = project.list_recipes()
+total_recipes = len(recipes)
 
-print("=" * 80)
-print("PHASE 1 + PHASE 2 SCAN")
-print("=" * 80)
+print(f"\nScanning {total_recipes} recipes...")
 
-for recipe_info in recipes:
+for index, recipe_info in enumerate(recipes):
 
     recipe_name = recipe_info["name"]
-    recipe_type = recipe_info.get("type")
+    recipe_type = recipe_info.get("type", "unknown")
 
-    print(f"Scanning Recipe: {recipe_name}")
+    print(f"  [{index + 1}/{total_recipes}] {recipe_name} ({recipe_type})", end="\r")
 
-    recipe_obj = project.get_recipe(recipe_name)
-    settings = recipe_obj.get_settings()
-
-    # ========================================================
-    # INPUTS
-    # ========================================================
-
-    try:
-        inputs = settings.get_recipe_inputs()
-    except:
-        inputs = {}
-
-    # ========================================================
-    # OUTPUTS
-    # ========================================================
-
-    try:
-        outputs = settings.get_recipe_outputs()
-    except:
-        outputs = {}
-
-    # ========================================================
-    # FLOW GRAPH
-    # ========================================================
-
+    # Register recipe in flow graph
     project_scan["recipes"].append({
         "name": recipe_name,
         "type": recipe_type
     })
 
+    # Get recipe settings — this is the main handle for all recipe data
     try:
+        recipe_obj = project.get_recipe(recipe_name)
+        settings = recipe_obj.get_settings()
+    except Exception as e:
+        recipe_errors += 1
+        recipe_intelligence["recipes"].append({
+            "recipe_name": recipe_name,
+            "recipe_type": recipe_type,
+            "error": f"Could not get settings: {str(e)}"
+        })
+        continue
 
+    # ------------------------------------------------------------------
+    # INPUT DATASETS
+    # Confirmed method: settings.get_recipe_inputs()
+    # Returns dict of {role: {items: [{ref: dataset_name}]}}
+    # ------------------------------------------------------------------
+    inputs = {}
+    input_dataset_names = []
+
+    try:
+        inputs = settings.get_recipe_inputs()
         for role, vals in inputs.items():
-
-            for item in vals:
-
+            for item in (vals.get("items", []) if isinstance(vals, dict) else vals):
                 ds = item.get("ref")
-
                 if ds:
-
+                    input_dataset_names.append(ds)
                     project_scan["edges"].append({
                         "source": ds,
                         "target": recipe_name,
                         "relationship": "INPUT"
                     })
+    except Exception as e:
+        inputs = {}
 
-    except:
-        pass
+    # ------------------------------------------------------------------
+    # OUTPUT DATASETS
+    # Confirmed method: settings.get_recipe_outputs()
+    # Returns dict of {role: {items: [{ref: dataset_name}]}}
+    # ------------------------------------------------------------------
+    outputs = {}
+    output_dataset_names = []
 
     try:
-
+        outputs = settings.get_recipe_outputs()
         for role, vals in outputs.items():
-
-            for item in vals:
-
+            for item in (vals.get("items", []) if isinstance(vals, dict) else vals):
                 ds = item.get("ref")
-
                 if ds:
-
+                    output_dataset_names.append(ds)
                     project_scan["edges"].append({
                         "source": recipe_name,
                         "target": ds,
                         "relationship": "OUTPUT"
                     })
+    except Exception as e:
+        outputs = {}
 
-    except:
-        pass
-
-    # ========================================================
+    # ------------------------------------------------------------------
     # RAW DEFINITION
-    # ========================================================
-
+    # Contains recipe configuration in raw format
+    # ------------------------------------------------------------------
+    raw_definition = {}
     try:
         raw_definition = settings.get_recipe_raw_definition()
-    except:
-        raw_definition = {}
-
-    # ========================================================
-    # PARAMETERS
-    # ========================================================
-
-    try:
-        params = settings.get_recipe_params()
-    except:
-        params = {}
-
-    # ========================================================
-    # PAYLOAD
-    # ========================================================
-
-    try:
-        payload = settings.get_payload()
-    except:
-        payload = None
-
-    # ========================================================
-    # JSON PAYLOAD
-    # ========================================================
-
-    try:
-        json_payload = settings.get_json_payload()
-    except:
-        json_payload = None
-
-    # ========================================================
-    # GENERATED SQL
-    # ========================================================
-
-    generated_sql = None
-
-    try:
-
-        status = recipe_obj.get_status()
-
-        if hasattr(status, "data"):
-
-            if isinstance(status.data, dict):
-
-                generated_sql = status.data.get("sql")
-
-    except:
+    except Exception:
         pass
 
-    # ========================================================
-    # JOINS
-    # ========================================================
+    # ------------------------------------------------------------------
+    # PARAMETERS
+    # Recipe-type specific parameters
+    # ------------------------------------------------------------------
+    params = {}
+    try:
+        params = settings.get_recipe_params()
+    except Exception:
+        pass
 
-    joins = []
+    # ------------------------------------------------------------------
+    # PAYLOAD (raw string payload — SQL text, Python code, etc.)
+    # Confirmed method: settings.get_payload()
+    # Returns the raw string payload of the recipe
+    # ------------------------------------------------------------------
+    payload = None
+    try:
+        payload = settings.get_payload()
+    except Exception:
+        pass
 
-    if hasattr(settings, "raw_joins"):
+    # ------------------------------------------------------------------
+    # JSON PAYLOAD (structured payload for Join, Group recipes etc.)
+    # Confirmed method: settings.get_json_payload()
+    # ------------------------------------------------------------------
+    json_payload = None
+    try:
+        json_payload = settings.get_json_payload()
+    except Exception:
+        pass
 
-        try:
-            joins = settings.raw_joins
-        except:
-            pass
-
-    # ========================================================
-    # CODE RECIPES
-    # ========================================================
-
+    # ------------------------------------------------------------------
+    # CODE (Python, PySpark, R recipes)
+    # Confirmed method: settings.get_code()
+    # Only available for code-type recipes
+    # ------------------------------------------------------------------
     recipe_code = None
-
-    if hasattr(settings, "get_code"):
-
-        try:
+    try:
+        if hasattr(settings, "get_code"):
             recipe_code = settings.get_code()
-        except:
-            pass
+    except Exception:
+        pass
 
-    # ========================================================
-    # STORE INTELLIGENCE
-    # ========================================================
+    # ------------------------------------------------------------------
+    # JOINS (Join recipe configuration)
+    # raw_joins contains the join keys and conditions
+    # ------------------------------------------------------------------
+    joins = []
+    try:
+        if hasattr(settings, "raw_joins"):
+            joins = settings.raw_joins or []
+    except Exception:
+        pass
 
-    recipe_intelligence.append({
+    # ------------------------------------------------------------------
+    # GENERATED SQL (from recipe status if available)
+    # Some SQL recipes expose the generated SQL via recipe status
+    # ------------------------------------------------------------------
+    generated_sql = None
+    try:
+        status = recipe_obj.get_status()
+        if hasattr(status, "data") and isinstance(status.data, dict):
+            generated_sql = status.data.get("sql")
+    except Exception:
+        pass
+
+    # Store all recipe intelligence
+    recipe_intelligence["recipes"].append({
         "recipe_name": recipe_name,
         "recipe_type": recipe_type,
         "settings_class": type(settings).__name__,
-        "inputs": inputs,
-        "outputs": outputs,
+        "inputs": input_dataset_names,
+        "outputs": output_dataset_names,
         "joins": joins,
         "params": params,
         "generated_sql": generated_sql,
@@ -253,55 +292,117 @@ for recipe_info in recipes:
         "code": recipe_code
     })
 
+    recipe_success += 1
+
+print(f"\n✅ Recipes scanned: {recipe_success} | ⚠️ Errors: {recipe_errors}")
+
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
-
 # ==========================================================================
-# DATASETS
+# STEP 4 - SCAN DATASETS
+#
+# For each dataset we capture:
+# - name
+# - full schema from get_schema() — confirmed Dataiku API method
+# - extracted column list (name + type) for Phase 2 attribute search
+# - connection and table info from raw settings
+#
+# Confirmed: dataset.get_schema() returns:
+# {"columns": [{"name": "col1", "type": "string"}, ...]}
 # ==========================================================================
 
-print("\nScanning Datasets...")
+all_datasets = project.list_datasets()
+total_datasets = len(all_datasets)
 
-for dataset_info in project.list_datasets():
+print(f"\nScanning {total_datasets} datasets...")
+
+for index, dataset_info in enumerate(all_datasets):
 
     dataset_name = dataset_info["name"]
 
-    print(f"Dataset: {dataset_name}")
+    print(f"  [{index + 1}/{total_datasets}] {dataset_name}", end="\r")
+
+    project_scan["datasets"].append({"name": dataset_name})
 
     try:
-
         dataset = project.get_dataset(dataset_name)
+
+        # ------------------------------------------------------------------
+        # SCHEMA — confirmed Dataiku API method
+        # dataset.get_schema() returns {"columns": [{"name": str, "type": str}]}
+        # ------------------------------------------------------------------
+        schema = {}
+        columns = []
+        column_details = []
 
         try:
             schema = dataset.get_schema()
-        except:
+
+            # Extract column list for Phase 2 attribute search
+            for col in schema.get("columns", []):
+                col_name = col.get("name")
+                col_type = col.get("type", "string")
+                if col_name:
+                    columns.append(col_name)
+                    column_details.append({
+                        "name": col_name,
+                        "type": col_type
+                    })
+
+        except Exception as e:
             schema = {}
+            columns = []
+            column_details = []
+
+        # ------------------------------------------------------------------
+        # RAW SETTINGS — connection, schema, table info
+        # dataset.get_settings().get_raw() returns full dataset config
+        # ------------------------------------------------------------------
+        raw_settings = {}
+        connection = None
+        db_schema = None
+        table = None
 
         try:
-            settings = dataset.get_settings().get_raw()
-        except:
-            settings = {}
+            raw_settings = dataset.get_settings().get_raw()
+            params = raw_settings.get("params", {})
+            connection = params.get("connection")
+            db_schema = params.get("schema")
+            table = params.get("table")
+        except Exception:
+            pass
 
-        dataset_registry[dataset_name] = {
-            "schema": schema,
-            "settings": settings
+        dataset_registry["datasets"][dataset_name] = {
+            "name": dataset_name,
+            "connection": connection,
+            "schema": db_schema,
+            "table": table,
+            "column_count": len(columns),
+            "columns": columns,              # simple list for quick search
+            "column_details": column_details, # name + type for Phase 3
+            "full_schema": schema            # complete schema for reference
         }
 
-        project_scan["datasets"].append({
-            "name": dataset_name
-        })
+        dataset_success += 1
 
     except Exception as e:
-
-        dataset_registry[dataset_name] = {
-            "error": str(e)
+        dataset_registry["datasets"][dataset_name] = {
+            "name": dataset_name,
+            "error": str(e),
+            "columns": [],
+            "column_details": [],
+            "column_count": 0
         }
+        dataset_errors += 1
+
+print(f"\n✅ Datasets scanned: {dataset_success} | ⚠️ Errors: {dataset_errors}")
 
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
 # ==========================================================================
-# SAVE TO MANAGED FOLDER
+# STEP 5 - HELPER: WRITE JSON TO MANAGED FOLDER
 # ==========================================================================
 
 def write_json_to_folder(folder, filename, payload):
+    """Write a Python object as JSON to a Dataiku Managed Folder."""
     with folder.get_writer(filename) as writer:
         writer.write(
             json.dumps(
@@ -310,57 +411,80 @@ def write_json_to_folder(folder, filename, payload):
                 default=str
             ).encode("utf-8")
         )
-
-write_json_to_folder(
-    Context_files,
-    "ARIS_PROJECT_GRAPH.json",
-    project_scan
-)
-
-write_json_to_folder(
-    Context_files,
-    "ARIS_RECIPE_INTELLIGENCE.json",
-    recipe_intelligence
-)
-
-write_json_to_folder(
-    Context_files,
-    "ARIS_DATASET_REGISTRY.json",
-    dataset_registry
-)
+    print(f"  ✅ Saved: {filename}")
 
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
 # ==========================================================================
-# SUMMARY
+# STEP 6 - SAVE ALL OUTPUTS TO MANAGED FOLDER
 # ==========================================================================
 
+print("\nSaving outputs to managed folder...")
+
+write_json_to_folder(Context_files, "ARIS_PROJECT_GRAPH.json", project_scan)
+write_json_to_folder(Context_files, "ARIS_RECIPE_INTELLIGENCE.json", recipe_intelligence)
+write_json_to_folder(Context_files, "ARIS_DATASET_REGISTRY.json", dataset_registry)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# STEP 7 - EXECUTION SUMMARY
+# ==========================================================================
+
+# Count recipe types
 recipe_type_counter = {}
-
-for r in recipe_intelligence:
-
+for r in recipe_intelligence["recipes"]:
     typ = r.get("recipe_type", "UNKNOWN")
-
-    recipe_type_counter[typ] = (
-        recipe_type_counter.get(typ, 0) + 1
-    )
+    recipe_type_counter[typ] = recipe_type_counter.get(typ, 0) + 1
 
 summary = {
-    "project": PROJECT_KEY,
-    "scan_timestamp": str(datetime.now()),
-    "recipes": len(project_scan["recipes"]),
-    "datasets": len(project_scan["datasets"]),
-    "edges": len(project_scan["edges"]),
-    "recipe_types": recipe_type_counter,
+    **ARIS_METADATA,
+    "execution": {
+        "recipes_scanned": recipe_success,
+        "recipes_with_errors": recipe_errors,
+        "datasets_scanned": dataset_success,
+        "datasets_with_errors": dataset_errors,
+        "edges_captured": len(project_scan["edges"]),
+        "recipe_type_breakdown": recipe_type_counter
+    },
     "output_files": [
         "ARIS_PROJECT_GRAPH.json",
         "ARIS_RECIPE_INTELLIGENCE.json",
         "ARIS_DATASET_REGISTRY.json",
         "ARIS_SUMMARY.json"
-    ]
+    ],
+    "next_phase": "Phase 2 - Impact Analysis (run ARIS_Phase2_ImpactAnalysis notebook)"
 }
 
-write_json_to_folder(
-    Context_files,
-    "ARIS_SUMMARY.json",
-    summary
-)
+write_json_to_folder(Context_files, "ARIS_SUMMARY.json", summary)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# STEP 8 - FINAL STATUS REPORT
+# ==========================================================================
+
+print("\n")
+print("=" * 80)
+print("ARIS Phase 1 Complete — Project Intelligence")
+print("=" * 80)
+print(f"Project              : {PROJECT_KEY}")
+print(f"Completed            : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print()
+print("Scan Results:")
+print(f"  Recipes scanned    : {recipe_success}")
+if recipe_errors > 0:
+    print(f"  ⚠️  Recipe errors   : {recipe_errors}")
+print(f"  Datasets scanned   : {dataset_success}")
+if dataset_errors > 0:
+    print(f"  ⚠️  Dataset errors  : {dataset_errors}")
+print(f"  Edges captured     : {len(project_scan['edges'])}")
+print()
+print("Recipe Type Breakdown:")
+for rtype, count in recipe_type_counter.items():
+    print(f"  {rtype:<20} : {count}")
+print()
+print("Output Files (in managed folder 'project_context'):")
+for f in summary["output_files"]:
+    print(f"  ✅ {f}")
+print()
+print("Next Step:")
+print("  Run ARIS Phase 2 — Impact Analysis")
+print("=" * 80)
