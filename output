@@ -50,3 +50,130 @@ print(f"  [{index + 1}/{total_recipes}] {recipe_name[:50]:<50}", end="\r")
 print(f"  [{index + 1}/{total_datasets}] {dataset_name}", end="\r")
 
 print(f"  [{index + 1}/{total_datasets}] {dataset_name[:50]:<50}", end="\r")
+
+
+
+
+#datasets:
+"ACTIVe_FLAGGED_DATA": {
+      "name": "ACTIVE_ _FLAGGED_DATA",
+      "connection": "Snowflake_PWSA0001511_MAP",
+      "schema": "${REBRANDING_SCHEMA}",
+      "table": "${projectKey}_ACTIVE_FLAGGED_DATA",
+      "column_count": 9,
+      "columns": [
+        "METADATA_ID",
+        "BRAND",
+        "CAMPAIGN",
+      ],
+
+
+#GRAPH:
+edges": [
+    {
+      "source": "Active_UNION",
+      "target": "compute_ACTIVE_FLAGGED_DATA",
+      "relationship": "INPUT"
+    },
+
+
+    {
+      "recipe_name": "compute_ACTIVE_ _FLAGGED_DATA",
+      "recipe_type": "sql_query",
+      "settings_class": "DSSRecipeSettings",
+      "inputs": [
+        "Active _UNION"
+      ],
+      "outputs": [
+        "ACTIVE_ _FLAGGED_DATA"
+      ],
+      "joins": [],
+      "params": {
+        "allowMultipleConnections": false,
+        "displayExecutionPlan": true,
+        "sqlPipelineParams": {
+          "pipelineAllowStart": true,
+          "pipelineAllowMerge": true
+        },
+        "variablesExpansionLoopConfig": {
+          "enabled": false,
+          "mode": "CREATE_VARIABLE_FOR_EACH_COLUMN",
+          "replacements": []
+        },
+        "skipPrerunValidate": false
+      },
+      "generated_sql": null,
+      "raw_definition": {
+        "name": "compute_ACTIVE_FLAGGED_DATA",
+        "projectKey": "JEM_HQE",
+        "type": "sql_query",
+        "neverRecomputeExistingPartitions": false,
+        "params": {
+          "allowMultipleConnections": false,
+          "displayExecutionPlan": true,
+          "sqlPipelineParams": {
+            "pipelineAllowStart": true,
+            "pipelineAllowMerge": true
+          },
+          "variablesExpansionLoopConfig": {
+            "enabled": false,
+            "mode": "CREATE_VARIABLE_FOR_EACH_COLUMN",
+            "replacements": []
+          },
+          "skipPrerunValidate": false
+        },
+        "customMeta": {
+          "kv": {}
+        },
+        "redispatchPartitioning": false,
+        "maxRunningActivities": 0,
+        "hashPropagationBehavior": "INHERIT",
+        "variables": {},
+        "dkuProperties": [],
+        "inputs": {
+          "main": {
+            "items": [
+              {
+                "ref": "Active_UNION",
+                "deps": []
+              }
+            ]
+          }
+        },
+        "outputs": {
+          "main": {
+            "items": [
+              {
+                "ref": "ACTIVE_FLAGGED_DATA",
+                "appendMode": false
+              }
+            ]
+          }
+        },
+        "labels": [],
+        "versionTag": {
+          "versionNumber": 7,
+          "lastModifiedBy": {
+            "login": "NRAE"
+          },
+          "lastModifiedOn": 1742206928208,
+          "extendedProperties": {}
+        },
+        "creationTag": {
+          "versionNumber": 0,
+          "lastModifiedBy": {
+            "login": "NRAE"
+          },
+          "lastModifiedOn": 1739797313434,
+          "extendedProperties": {}
+        },
+        "tags": [],
+        "customFields": {},
+        "checklists": {
+          "checklists": []
+        }
+      },
+      "payload": "SELECT\n    \"METADATA_ID\",\n    \"BRAND_NAME\" AS BRAND,\n    \"CAMPAIGN\",\n    \"CONTENT_ID\",\n    \"ASSET_EXPIRY_DATE\",\n    \"CURRENT_ASSET_STATUS\" AS ASSET_STATUS,\n    CASE\n        WHEN ASSET_EXPIRY_DATE IS NULL THEN 'Null'\n        ELSE CASE\n            WHEN CURRENT_DATE < ASSET_EXPIRY_DATE THEN '0'\n            ELSE '1'\n        END\n    END AS FuseExpiredDateFlag,\n    CASE\n        WHEN ASSET_EXPIRY_DATE IS NULL THEN 1\n        ELSE 0\n    END as FuseMissingExpirydateFlag,\n    CASE\n        WHEN CONTENT_ID IS NULL THEN 1\n        ELSE 0\n    END AS FuseMissingContentIDFlag\nFROM\n    \"TABLE\"\nWHERE\n    FLAG = '1'\n    OR NOFLAG = 'Null'",
+      "json_payload": null,
+      "code": null
+    },
