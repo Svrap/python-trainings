@@ -1,0 +1,698 @@
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# ARIS - Automated Recipe Intelligence System
+# AI for Request Impact and Scope
+#
+# PHASE 3 - TRANSFORMATION INTELLIGENCE
+# Purpose: For each recipe impacted in Phase 2 — read the actual SQL,
+#          Python, or Join code and classify how the attribute behaves.
+#
+# HOW TO USE
+# ----------
+# 1. Run Phase 1 and Phase 2 first
+# 2. No configuration needed — reads Phase 2 output automatically
+# 3. Run all cells in order
+#
+# PREREQUISITES
+# -------------
+# Managed folder "project_context" must contain:
+#   - ARIS_IMPACT_ANALYSIS.json  (from Phase 2)
+#   - ARIS_RECIPE_INTELLIGENCE.json (from Phase 1)
+#
+# OUTPUTS (saved to managed folder "project_context")
+# -------
+# ARIS_TRANSFORMATION_ANALYSIS.json  - classification per recipe
+# ARIS_TRANSFORMATION_ANALYSIS.md    - human-readable report
+#
+# CLASSIFICATION TYPES
+# --------------------
+# PASSTHROUGH   - Column selected as-is, no modification
+# TRANSFORMED   - Column renamed or modified (e.g. BRAND_NAME AS BRAND)
+# CALCULATED    - Column derived arithmetically (CASE WHEN, arithmetic)
+# AGGREGATED    - Column aggregated (SUM, COUNT, AVG, MIN, MAX)
+# JOIN_KEY      - Column used as join condition
+# CREATED       - Column created new in this recipe (not in inputs)
+# DROPPED       - Column explicitly excluded from output
+# FILTER_RULE   - Column in WHERE/HAVING only, not in SELECT
+# REFERENCED    - Column appears in code but not clearly classified
+# UNKNOWN       - Cannot determine from available code
+# NOT_FOUND     - Attribute not mentioned anywhere in this recipe
+#
+# VERSION
+# -------
+# ARIS v1.0 | Phase 3 - Transformation Intelligence
+# ==========================================================================
+
+import dataiku
+import json
+import re
+from datetime import datetime
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# STEP 1 - CONNECT AND LOAD PHASE 1 + PHASE 2 OUTPUTS
+# ==========================================================================
+
+PROJECT_KEY = dataiku.default_project_key()
+client = dataiku.api_client()
+project = client.get_project(PROJECT_KEY)
+
+# Find managed folder
+PROJECT_CONTEXT_FOLDER_ID = None
+for folder in project.list_managed_folders():
+    try:
+        if folder["name"].lower() == "project_context":
+            PROJECT_CONTEXT_FOLDER_ID = folder["id"]
+            break
+    except Exception:
+        pass
+
+if PROJECT_CONTEXT_FOLDER_ID is None:
+    raise Exception("Managed folder 'project_context' not found.")
+
+context_folder = dataiku.Folder(PROJECT_CONTEXT_FOLDER_ID)
+
+print("=" * 80)
+print("ARIS v1.0 | Phase 3 — Transformation Intelligence")
+print("=" * 80)
+print(f"Project        : {PROJECT_KEY}")
+print(f"Started        : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 80)
+
+def load_json_from_folder(folder, filename):
+    """Load a JSON file from a Dataiku Managed Folder."""
+    try:
+        with folder.get_download_stream(filename) as stream:
+            return json.loads(stream.read().decode("utf-8"))
+    except Exception as e:
+        raise Exception(f"Could not load {filename}. Error: {e}")
+
+print("\nLoading Phase 1 and Phase 2 outputs...")
+
+recipe_intelligence_data = load_json_from_folder(
+    context_folder, "ARIS_RECIPE_INTELLIGENCE.json"
+)
+impact_analysis_data = load_json_from_folder(
+    context_folder, "ARIS_IMPACT_ANALYSIS.json"
+)
+
+# Build recipe lookup map from Phase 1
+recipes_map = {
+    r["recipe_name"]: r
+    for r in recipe_intelligence_data.get("recipes", [])
+}
+
+# Get impacted recipes and attributes from Phase 2
+attribute_impact = impact_analysis_data.get("attribute_impact", {})
+search_terms = impact_analysis_data.get("search_terms", [])
+
+print(f"✅ Recipes loaded    : {len(recipes_map)}")
+print(f"✅ Attributes        : {search_terms}")
+
+# Collect all unique impacted recipes across all attributes
+all_impacted_recipes = set()
+for term, result in attribute_impact.items():
+    if result.get("status") == "FOUND":
+        for r in result.get("downstream", {}).get("recipes", []):
+            all_impacted_recipes.add(r["name"])
+        for r in result.get("upstream", {}).get("recipes", []):
+            all_impacted_recipes.add(r["name"])
+
+print(f"✅ Impacted recipes  : {len(all_impacted_recipes)}")
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# STEP 2 - SQL CLASSIFICATION ENGINE
+#
+# Reads the SQL payload and classifies how an attribute behaves.
+# Uses regex pattern matching on the SQL text.
+# Case-insensitive throughout.
+# ==========================================================================
+
+def classify_attribute_in_sql(sql_text, attribute):
+    """
+    Classify how an attribute behaves in a SQL recipe.
+
+    Returns a dict with:
+      - classification: the primary classification string
+      - confidence: HIGH / MEDIUM / LOW
+      - evidence: the matching SQL snippet that led to classification
+      - notes: human-readable explanation
+    """
+    if not sql_text or not attribute:
+        return {
+            "classification": "UNKNOWN",
+            "confidence": "LOW",
+            "evidence": None,
+            "notes": "No SQL text available to analyse."
+        }
+
+    sql_upper = sql_text.upper().strip()
+    attr_upper = attribute.upper().strip()
+
+    # Attribute not mentioned at all
+    if attr_upper not in sql_upper:
+        return {
+            "classification": "NOT_FOUND",
+            "confidence": "HIGH",
+            "evidence": None,
+            "notes": f"'{attribute}' does not appear anywhere in this recipe's SQL."
+        }
+
+    # ------------------------------------------------------------------
+    # 1. AGGREGATED
+    # Pattern: SUM(attr), COUNT(attr), AVG(attr), MIN(attr), MAX(attr)
+    # ------------------------------------------------------------------
+    agg_pattern = rf"(SUM|COUNT|AVG|MIN|MAX|COUNT_DISTINCT)\s*\(\s*[^\)]*{attr_upper}[^\)]*\)"
+    agg_match = re.search(agg_pattern, sql_upper)
+    if agg_match:
+        snippet = sql_upper[max(0, agg_match.start()-20):agg_match.end()+20]
+        return {
+            "classification": "AGGREGATED",
+            "confidence": "HIGH",
+            "evidence": snippet.strip(),
+            "notes": f"'{attribute}' is aggregated using {agg_match.group(1)}()."
+        }
+
+    # ------------------------------------------------------------------
+    # 2. TRANSFORMED — renamed: ORIGINAL_NAME AS ALIAS
+    # Pattern: something AS attribute or attribute AS something_else
+    # ------------------------------------------------------------------
+    # Case: another_col AS BRAND  (incoming rename — attribute is output name)
+    as_to_attr = rf"\w+\s+AS\s+{attr_upper}[\s,\n]"
+    as_match = re.search(as_to_attr, sql_upper)
+    if as_match:
+        snippet = sql_upper[max(0, as_match.start()-10):as_match.end()+10]
+        return {
+            "classification": "TRANSFORMED",
+            "confidence": "HIGH",
+            "evidence": snippet.strip(),
+            "notes": f"'{attribute}' is the output name of a renamed column (X AS {attribute})."
+        }
+
+    # Case: BRAND AS something_else (attribute renamed outward)
+    attr_as_other = rf"{attr_upper}\s+AS\s+\w+"
+    attr_as_match = re.search(attr_as_other, sql_upper)
+    if attr_as_match:
+        snippet = sql_upper[max(0, attr_as_match.start()-10):attr_as_match.end()+10]
+        return {
+            "classification": "TRANSFORMED",
+            "confidence": "HIGH",
+            "evidence": snippet.strip(),
+            "notes": f"'{attribute}' is renamed to another column name in output."
+        }
+
+    # ------------------------------------------------------------------
+    # 3. CALCULATED — CASE WHEN or arithmetic involving the attribute
+    # ------------------------------------------------------------------
+    # Check if attribute appears in a CASE WHEN block
+    case_pattern = rf"CASE\s+WHEN[^E]*{attr_upper}[^E]*END"
+    case_match = re.search(case_pattern, sql_upper, re.DOTALL)
+    if case_match:
+        snippet = sql_upper[max(0, case_match.start()):case_match.start()+80]
+        return {
+            "classification": "CALCULATED",
+            "confidence": "HIGH",
+            "evidence": snippet.strip(),
+            "notes": f"'{attribute}' is used inside a CASE WHEN expression."
+        }
+
+    # Check arithmetic operations involving attribute
+    arithmetic_pattern = rf"{attr_upper}\s*[\+\-\*\/]|[\+\-\*\/]\s*{attr_upper}"
+    arith_match = re.search(arithmetic_pattern, sql_upper)
+    if arith_match:
+        snippet = sql_upper[max(0, arith_match.start()-15):arith_match.end()+15]
+        return {
+            "classification": "CALCULATED",
+            "confidence": "HIGH",
+            "evidence": snippet.strip(),
+            "notes": f"'{attribute}' is used in an arithmetic calculation."
+        }
+
+    # ------------------------------------------------------------------
+    # 4. FILTER_RULE — attribute only in WHERE or HAVING clause
+    # ------------------------------------------------------------------
+    # Split SQL into SELECT and WHERE parts
+    where_split = re.split(r'\bWHERE\b|\bHAVING\b', sql_upper, maxsplit=1, flags=re.IGNORECASE)
+    select_part = where_split[0]
+    where_part = where_split[1] if len(where_split) > 1 else ""
+
+    attr_in_select = attr_upper in select_part
+    attr_in_where = attr_upper in where_part
+
+    if attr_in_where and not attr_in_select:
+        # Find the WHERE clause evidence
+        where_idx = sql_upper.find(attr_upper, len(select_part))
+        snippet = sql_upper[max(0, where_idx-20):where_idx+40]
+        return {
+            "classification": "FILTER_RULE",
+            "confidence": "HIGH",
+            "evidence": snippet.strip(),
+            "notes": f"'{attribute}' appears only in WHERE/HAVING clause — not selected in output."
+        }
+
+    # ------------------------------------------------------------------
+    # 5. PASSTHROUGH — attribute in SELECT as-is (no transformation)
+    # ------------------------------------------------------------------
+    if attr_in_select:
+        # Check for SELECT * (all columns pass through)
+        if "SELECT *" in select_part or "SELECT\n*" in select_part:
+            return {
+                "classification": "PASSTHROUGH",
+                "confidence": "MEDIUM",
+                "evidence": "SELECT *",
+                "notes": f"Recipe uses SELECT * — '{attribute}' passes through if present in source."
+            }
+
+        # Direct SELECT: column appears in SELECT clause directly
+        # Pattern: comma or SELECT at start, then attribute, then comma or FROM
+        direct_select = rf"(?:SELECT|,)\s*[\"\`]?{attr_upper}[\"\`]?\s*(?:,|\n|FROM)"
+        direct_match = re.search(direct_select, select_part)
+        if direct_match:
+            snippet = select_part[max(0, direct_match.start()):direct_match.end()+10]
+            return {
+                "classification": "PASSTHROUGH",
+                "confidence": "HIGH",
+                "evidence": snippet.strip(),
+                "notes": f"'{attribute}' is selected directly without transformation."
+            }
+
+        # Attribute in SELECT but pattern not matched clearly
+        return {
+            "classification": "PASSTHROUGH",
+            "confidence": "MEDIUM",
+            "evidence": f"Found '{attribute}' in SELECT portion",
+            "notes": f"'{attribute}' appears in SELECT clause — likely passed through."
+        }
+
+    # ------------------------------------------------------------------
+    # 6. REFERENCED — attribute appears but not clearly classified
+    # ------------------------------------------------------------------
+    return {
+        "classification": "REFERENCED",
+        "confidence": "LOW",
+        "evidence": f"'{attribute}' found in SQL but classification unclear",
+        "notes": f"'{attribute}' appears in the recipe but its exact role could not be determined. Manual review recommended."
+    }
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# STEP 3 - JOIN RECIPE CLASSIFICATION
+#
+# Join recipes don't have SQL — they have join configuration.
+# We check if attribute is used as a join key.
+# ==========================================================================
+
+def classify_attribute_in_join(recipe_data, attribute):
+    """
+    Classify how an attribute behaves in a Join recipe.
+    Checks join key configuration.
+    """
+    attr_upper = attribute.upper()
+
+    # Check joins array
+    joins = recipe_data.get("joins", [])
+    for join in joins:
+        # Join key conditions
+        conditions = join.get("on", []) if isinstance(join, dict) else []
+        for condition in conditions:
+            left_col = str(condition.get("column1", {}).get("name", "")).upper()
+            right_col = str(condition.get("column2", {}).get("name", "")).upper()
+            if attr_upper in left_col or attr_upper in right_col:
+                return {
+                    "classification": "JOIN_KEY",
+                    "confidence": "HIGH",
+                    "evidence": f"Join condition: {condition}",
+                    "notes": f"'{attribute}' is used as a join key in this Join recipe."
+                }
+
+    # Check json_payload for selected columns
+    json_payload = recipe_data.get("json_payload", {})
+    if json_payload and isinstance(json_payload, dict):
+        selected_columns = json_payload.get("selectedColumns", [])
+        for col_entry in selected_columns:
+            col_name = str(col_entry.get("name", "")).upper()
+            if attr_upper in col_name:
+                return {
+                    "classification": "PASSTHROUGH",
+                    "confidence": "MEDIUM",
+                    "evidence": f"Column selected: {col_entry.get('name')}",
+                    "notes": f"'{attribute}' is included in the Join recipe output columns."
+                }
+
+    # Attribute not found in join config
+    return {
+        "classification": "NOT_FOUND",
+        "confidence": "MEDIUM",
+        "evidence": None,
+        "notes": f"'{attribute}' not found in Join recipe configuration. May be implicitly included."
+    }
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# STEP 4 - PYTHON RECIPE CLASSIFICATION
+#
+# For Python/PySpark recipes — search the code text for attribute references.
+# Less precise than SQL parsing but captures obvious patterns.
+# ==========================================================================
+
+def classify_attribute_in_python(recipe_data, attribute):
+    """
+    Classify how an attribute behaves in a Python or PySpark recipe.
+    Searches for column references in the code.
+    """
+    code = recipe_data.get("code", "")
+    payload = recipe_data.get("payload", "")
+
+    # Use whichever has content
+    code_text = code if code else payload
+    if not code_text:
+        return {
+            "classification": "UNKNOWN",
+            "confidence": "LOW",
+            "evidence": None,
+            "notes": "No Python code available to analyse."
+        }
+
+    attr_upper = attribute.upper()
+    code_upper = code_text.upper()
+
+    if attr_upper not in code_upper:
+        return {
+            "classification": "NOT_FOUND",
+            "confidence": "MEDIUM",
+            "evidence": None,
+            "notes": f"'{attribute}' not referenced in Python code."
+        }
+
+    # Find the line containing the attribute
+    for line in code_text.split("\n"):
+        if attr_upper in line.upper():
+            evidence_line = line.strip()
+            break
+    else:
+        evidence_line = f"Found '{attribute}' in code"
+
+    # Check for groupby/aggregation
+    if any(agg in code_upper for agg in ["GROUPBY", "GROUP_BY", ".SUM(", ".COUNT(", ".AGG("]):
+        if attr_upper in code_upper:
+            return {
+                "classification": "AGGREGATED",
+                "confidence": "MEDIUM",
+                "evidence": evidence_line,
+                "notes": f"'{attribute}' may be involved in a groupby/aggregation. Manual review recommended."
+            }
+
+    # Check for rename/alias
+    if any(pattern in code_upper for pattern in [f'RENAME({attr_upper}', f'"{attr_upper}":', f"'{attr_upper}'"]):
+        return {
+            "classification": "TRANSFORMED",
+            "confidence": "MEDIUM",
+            "evidence": evidence_line,
+            "notes": f"'{attribute}' appears in a rename or mapping context."
+        }
+
+    # General reference
+    return {
+        "classification": "REFERENCED",
+        "confidence": "LOW",
+        "evidence": evidence_line,
+        "notes": f"'{attribute}' is referenced in Python code. Manual review recommended for exact behavior."
+    }
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# STEP 5 - RUN CLASSIFICATION FOR ALL IMPACTED RECIPES
+# ==========================================================================
+
+print("\nClassifying attribute behavior in impacted recipes...")
+
+classification_results = {}
+success_count = 0
+error_count = 0
+
+for index, recipe_name in enumerate(sorted(all_impacted_recipes)):
+
+    print(f"  [{index+1}/{len(all_impacted_recipes)}] {recipe_name[:60]:<60}", end="\r")
+
+    recipe_data = recipes_map.get(recipe_name)
+
+    if not recipe_data:
+        error_count += 1
+        classification_results[recipe_name] = {
+            "recipe_name": recipe_name,
+            "recipe_type": "UNKNOWN",
+            "error": "Recipe not found in Phase 1 intelligence",
+            "attributes": {}
+        }
+        continue
+
+    recipe_type = recipe_data.get("recipe_type", "unknown")
+    recipe_result = {
+        "recipe_name": recipe_name,
+        "recipe_type": recipe_type,
+        "inputs": recipe_data.get("inputs", []),
+        "outputs": recipe_data.get("outputs", []),
+        "attributes": {}
+    }
+
+    # Classify each search term in this recipe
+    for term in search_terms:
+
+        if recipe_type in ("sql_query", "sql_script", "hive", "spark_sql"):
+            # SQL recipe — use SQL classifier
+            sql_text = recipe_data.get("payload", "") or recipe_data.get("generated_sql", "")
+            classification = classify_attribute_in_sql(sql_text, term)
+
+        elif recipe_type == "join":
+            # Join recipe — use join classifier
+            classification = classify_attribute_in_join(recipe_data, term)
+
+        elif recipe_type in ("python", "pyspark", "r"):
+            # Code recipe — use Python classifier
+            classification = classify_attribute_in_python(recipe_data, term)
+
+        else:
+            # Unknown recipe type
+            classification = {
+                "classification": "UNKNOWN",
+                "confidence": "LOW",
+                "evidence": None,
+                "notes": f"Recipe type '{recipe_type}' — manual review required."
+            }
+
+        recipe_result["attributes"][term] = classification
+
+    classification_results[recipe_name] = recipe_result
+    success_count += 1
+
+print(f"\n✅ Classified: {success_count} recipes | ⚠️ Errors: {error_count}")
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# STEP 6 - BUILD SUMMARY STATISTICS
+# ==========================================================================
+
+# Count classifications per attribute
+classification_summary = {}
+
+for term in search_terms:
+    counts = {}
+    for recipe_name, result in classification_results.items():
+        attr_result = result.get("attributes", {}).get(term, {})
+        cls = attr_result.get("classification", "UNKNOWN")
+        counts[cls] = counts.get(cls, 0) + 1
+    classification_summary[term] = counts
+
+# Identify recipes needing manual review
+manual_review_needed = []
+for recipe_name, result in classification_results.items():
+    for term, attr_result in result.get("attributes", {}).items():
+        if attr_result.get("confidence") == "LOW" or \
+           attr_result.get("classification") in ("REFERENCED", "UNKNOWN"):
+            manual_review_needed.append({
+                "recipe": recipe_name,
+                "attribute": term,
+                "reason": attr_result.get("notes", "")
+            })
+            break
+
+print(f"\nClassification Summary:")
+for term, counts in classification_summary.items():
+    print(f"\n  Attribute: '{term}'")
+    for cls, count in sorted(counts.items(), key=lambda x: -x[1]):
+        print(f"    {cls:<20} : {count}")
+
+print(f"\n⚠️  Recipes needing manual review: {len(manual_review_needed)}")
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# STEP 7 - BUILD JSON OUTPUT
+# ==========================================================================
+
+ARIS_METADATA = {
+    "aris_version": "1.0",
+    "phase": "Phase 3 - Transformation Intelligence",
+    "project": PROJECT_KEY,
+    "generated_at": datetime.now().isoformat(timespec="seconds"),
+    "stale_after_days": 7
+}
+
+transformation_analysis_json = {
+    **ARIS_METADATA,
+    "search_terms": search_terms,
+    "recipes_analysed": success_count,
+    "classification_summary": classification_summary,
+    "manual_review_needed": manual_review_needed,
+    "recipe_classifications": classification_results
+}
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# STEP 8 - BUILD MARKDOWN REPORT
+# ==========================================================================
+
+def build_transformation_report(data):
+    lines = []
+
+    lines.append("# ARIS Transformation Intelligence Report")
+    lines.append(f"\n**Project:** {data['project']}")
+    lines.append(f"**Generated:** {data['generated_at']}")
+    lines.append(f"**Attributes analysed:** {', '.join(data['search_terms'])}")
+    lines.append(f"**Recipes analysed:** {data['recipes_analysed']}")
+
+    # Warnings first
+    if data["manual_review_needed"]:
+        lines.append("\n---\n")
+        lines.append("## ⚠️ Recipes Requiring Manual Review\n")
+        lines.append("These recipes could not be classified with high confidence:")
+        lines.append("")
+        lines.append("| Recipe | Attribute | Reason |")
+        lines.append("|---|---|---|")
+        for item in data["manual_review_needed"]:
+            lines.append(f"| {item['recipe']} | {item['attribute']} | {item['reason'][:80]} |")
+
+    # Classification summary per attribute
+    lines.append("\n---\n")
+    lines.append("## Classification Summary\n")
+
+    for term, counts in data["classification_summary"].items():
+        lines.append(f"### Attribute: `{term}`\n")
+        lines.append("| Classification | Recipe Count |")
+        lines.append("|---|---|")
+        for cls, count in sorted(counts.items(), key=lambda x: -x[1]):
+            lines.append(f"| {cls} | {count} |")
+        lines.append("")
+
+    # Per-recipe detail
+    lines.append("\n---\n")
+    lines.append("## Recipe-Level Classification Detail\n")
+
+    for recipe_name, result in data["recipe_classifications"].items():
+
+        if "error" in result:
+            lines.append(f"### ❌ {recipe_name}")
+            lines.append(f"Error: {result['error']}\n")
+            continue
+
+        lines.append(f"### {recipe_name}")
+        lines.append(f"**Type:** {result['recipe_type']} | "
+                     f"**Inputs:** {', '.join(result['inputs'])} | "
+                     f"**Outputs:** {', '.join(result['outputs'])}\n")
+
+        lines.append("| Attribute | Classification | Confidence | Evidence |")
+        lines.append("|---|---|---|---|")
+
+        for term, attr_result in result["attributes"].items():
+            cls = attr_result.get("classification", "UNKNOWN")
+            conf = attr_result.get("confidence", "LOW")
+            evidence = (attr_result.get("evidence") or "")[:60]
+            lines.append(f"| {term} | **{cls}** | {conf} | `{evidence}` |")
+
+        # Notes
+        for term, attr_result in result["attributes"].items():
+            note = attr_result.get("notes", "")
+            if note:
+                lines.append(f"\n> **{term}:** {note}")
+
+        lines.append("")
+
+    # Classification legend
+    lines.append("\n---\n")
+    lines.append("## Classification Reference\n")
+    lines.append("| Classification | Meaning | Action Required |")
+    lines.append("|---|---|---|")
+    lines.append("| PASSTHROUGH | Column flows through unchanged | Verify output schema includes column |")
+    lines.append("| TRANSFORMED | Column renamed or modified | Check new name propagates correctly |")
+    lines.append("| CALCULATED | Derived from logic/arithmetic | Check source columns are available |")
+    lines.append("| AGGREGATED | Grouped/aggregated | Check GROUP BY logic still valid |")
+    lines.append("| JOIN_KEY | Used in join condition | Ensure join key is present in both sides |")
+    lines.append("| FILTER_RULE | In WHERE clause only | No output change needed |")
+    lines.append("| NOT_FOUND | Not in this recipe | No action needed |")
+    lines.append("| REFERENCED | Unclear role | Manual review required |")
+    lines.append("| UNKNOWN | Cannot determine | Manual review required |")
+
+    lines.append("\n---\n")
+    lines.append("## Next Step\n")
+    lines.append("Run **ARIS Phase 4 — Implementation Scope** to generate")
+    lines.append("work items, suggested code changes, and test plans.")
+
+    return "\n".join(lines)
+
+markdown_report = build_transformation_report(transformation_analysis_json)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# STEP 9 - SAVE OUTPUTS
+# ==========================================================================
+
+def write_json_to_folder(folder, filename, payload):
+    with folder.get_writer(filename) as writer:
+        writer.write(json.dumps(payload, indent=2, default=str).encode("utf-8"))
+    print(f"  ✅ Saved: {filename}")
+
+def write_text_to_folder(folder, filename, text):
+    with folder.get_writer(filename) as writer:
+        writer.write(text.encode("utf-8"))
+    print(f"  ✅ Saved: {filename}")
+
+print("\nSaving outputs...")
+write_json_to_folder(context_folder, "ARIS_TRANSFORMATION_ANALYSIS.json", transformation_analysis_json)
+write_text_to_folder(context_folder, "ARIS_TRANSFORMATION_ANALYSIS.md", markdown_report)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# ==========================================================================
+# STEP 10 - FINAL STATUS REPORT
+# ==========================================================================
+
+print("\n")
+print("=" * 80)
+print("ARIS Phase 3 Complete — Transformation Intelligence")
+print("=" * 80)
+print(f"Project              : {PROJECT_KEY}")
+print(f"Completed            : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"Recipes classified   : {success_count}")
+print()
+
+for term, counts in classification_summary.items():
+    print(f"  Attribute: '{term}'")
+    for cls, count in sorted(counts.items(), key=lambda x: -x[1]):
+        if count > 0:
+            print(f"    {cls:<20} : {count} recipe(s)")
+    print()
+
+if manual_review_needed:
+    print(f"⚠️  {len(manual_review_needed)} recipe(s) need manual review")
+    for item in manual_review_needed[:3]:
+        print(f"   - {item['recipe']} | {item['attribute']}")
+    if len(manual_review_needed) > 3:
+        print(f"   ... and {len(manual_review_needed)-3} more")
+    print()
+
+print("Output Files:")
+print("  ✅ ARIS_TRANSFORMATION_ANALYSIS.json")
+print("  ✅ ARIS_TRANSFORMATION_ANALYSIS.md")
+print()
+print("Next Step:")
+print("  Run ARIS Phase 4 — Implementation Scope & Code Generator")
+print("=" * 80)
