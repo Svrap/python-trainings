@@ -1,0 +1,1022 @@
+# ============================================================
+# ARIS Phase 3 - Code Intelligence
+# Reads actual SQL, Python, Join, Group and Window recipe code
+# from Phase 1 outputs and builds complete code-level knowledge.
+#
+# Handles ALL Dataiku recipe types:
+#   sql_query, sql_script, hive, spark_sql -> SQL analysis
+#   join                                   -> Join key analysis
+#   python, pyspark, r                     -> Python code analysis
+#   grouping                               -> Group/aggregation analysis
+#   window                                 -> Window function analysis
+#   everything else                        -> Stored with inputs/outputs
+#
+# RUN FROM PROJECT ROOT:
+#   python phase3_transformation\transformation.py
+#
+# PREREQUISITES:
+#   Phase 1 must have run: python phase1_scanner\scanner.py
+#
+# OUTPUTS (in outputs\ folder):
+#   {PREFIX}CODE_INTELLIGENCE.json  - full code analysis per recipe
+#   {PREFIX}CODE_INTELLIGENCE.md    - human readable for LLM
+#   {PREFIX}COLUMN_INDEX.json       - every column + how it behaves
+#   {PREFIX}SQL_SUMMARY.md          - all SQL code in one file
+# ============================================================
+
+import json
+import os
+import re
+import sys
+from datetime import datetime
+
+
+
+from src.config import (
+    PROJECT_KEY,
+    LOCAL_OUTPUT_DIR,
+    STALE_AFTER_DAYS,
+    RECIPE_INTELLIGENCE_FILE,
+    DATASET_REGISTRY_FILE,
+    OUTPUT_PREFIX,
+    output_path
+)
+
+CODE_INTELLIGENCE_FILE = f"{OUTPUT_PREFIX}CODE_INTELLIGENCE.json"
+CODE_INTELLIGENCE_MD   = f"{OUTPUT_PREFIX}CODE_INTELLIGENCE.md"
+COLUMN_INDEX_FILE      = f"{OUTPUT_PREFIX}COLUMN_INDEX.json"
+SQL_SUMMARY_MD         = f"{OUTPUT_PREFIX}SQL_SUMMARY.md"
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def load_json(filename):
+    path = output_path(filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"File not found: {path}\n"
+            f"Run Phase 1 first: python phase1_scanner\\scanner.py"
+        )
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_json(filename, data):
+    path = output_path(filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str)
+    print(f"  [SAVED] {filename}")
+
+def save_text(filename, text):
+    path = output_path(filename)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"  [SAVED] {filename}")
+
+def update_column_index(column_index, col, recipe_name, recipe_type, behavior):
+    if not col:
+        return
+    if col not in column_index:
+        column_index[col] = []
+    column_index[col].append({
+        "recipe":   recipe_name,
+        "type":     recipe_type,
+        "behavior": behavior
+    })
+
+# ============================================================
+# SQL ANALYSER
+# Generic - works for any SQL in any domain.
+# ============================================================
+
+RESERVED = {
+    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "AS", "ON",
+    "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS",
+    "GROUP", "BY", "ORDER", "HAVING", "LIMIT", "UNION", "ALL",
+    "CASE", "WHEN", "THEN", "ELSE", "END", "IN", "IS", "NULL",
+    "LIKE", "BETWEEN", "EXISTS", "DISTINCT", "WITH", "TOP",
+    "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER",
+    "TRUE", "FALSE", "ASC", "DESC", "INTO", "VALUES", "SET"
+}
+
+def extract_columns_from_sql(sql_text):
+    """
+    Extract column usage from SQL text by clause type.
+    Returns dict with classified column lists.
+    """
+    if not sql_text:
+        return {}
+
+    sql_upper = sql_text.upper()
+    result = {
+        "select_columns":    [],
+        "where_columns":     [],
+        "join_columns":      [],
+        "group_columns":     [],
+        "order_columns":     [],
+        "case_columns":      [],
+        "aggregate_columns": []
+    }
+
+    # --- AGGREGATE functions ---
+    agg_pattern = r'(SUM|COUNT|AVG|MIN|MAX|COUNT_DISTINCT|MEDIAN|VARIANCE|STDDEV)\s*\(\s*(?:DISTINCT\s+)?([^)]+?)\s*\)'
+    for m in re.finditer(agg_pattern, sql_upper):
+        func = m.group(1)
+        col  = m.group(2).strip().strip('"').strip("'").strip("`")
+        if col and col not in ("*",) and col not in RESERVED:
+            result["aggregate_columns"].append({"column": col, "function": func})
+
+    # --- CASE WHEN columns ---
+    for m in re.finditer(r'CASE\s+WHEN\s+"?([A-Z_][A-Z0-9_]*)"?', sql_upper):
+        col = m.group(1)
+        if col not in RESERVED:
+            result["case_columns"].append(col)
+
+    # --- SELECT clause columns ---
+    select_match = re.search(r'SELECT\s+(.*?)\s+FROM\s', sql_upper, re.DOTALL)
+    if select_match:
+        select_text = select_match.group(1)
+
+        # Renamed: SOMETHING AS ALIAS
+        for m in re.finditer(
+            r'"?([A-Z_][A-Z0-9_.]*)"?\s+AS\s+"?([A-Z_][A-Z0-9_]*)"?',
+            select_text
+        ):
+            source = m.group(1).strip('"').strip("'")
+            alias  = m.group(2)
+            if alias not in RESERVED and source not in RESERVED:
+                result["select_columns"].append({
+                    "source":      source,
+                    "alias":       alias,
+                    "transformed": source.upper() != alias.upper()
+                })
+
+        # Direct column refs not already captured in AS
+        for m in re.finditer(r'"([A-Z_][A-Z0-9_]*)"', select_text):
+            col = m.group(1)
+            already = any(
+                c.get("source") == col or c.get("alias") == col
+                for c in result["select_columns"]
+            )
+            if not already and col not in RESERVED:
+                result["select_columns"].append({
+                    "source":      col,
+                    "alias":       col,
+                    "transformed": False
+                })
+
+    # --- WHERE clause columns ---
+    where_match = re.search(
+        r'\bWHERE\b(.*?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|$)',
+        sql_upper, re.DOTALL
+    )
+    if where_match:
+        where_text = where_match.group(1)
+        for m in re.finditer(
+            r'"?([A-Z_][A-Z0-9_]*)"?\s*(?:=|!=|<>|>=|<=|>|<|\bIS\b|\bIN\b|\bLIKE\b|\bNOT\b)',
+            where_text
+        ):
+            col = m.group(1)
+            if col not in RESERVED:
+                result["where_columns"].append(col)
+
+    # --- GROUP BY columns ---
+    group_match = re.search(
+        r'\bGROUP\s+BY\b(.*?)(?:\bHAVING\b|\bORDER\s+BY\b|$)',
+        sql_upper, re.DOTALL
+    )
+    if group_match:
+        for m in re.finditer(r'"?([A-Z_][A-Z0-9_]*)"?', group_match.group(1)):
+            col = m.group(1)
+            if col not in RESERVED:
+                result["group_columns"].append(col)
+
+    # --- ORDER BY columns ---
+    order_match = re.search(r'\bORDER\s+BY\b(.*?)$', sql_upper, re.DOTALL)
+    if order_match:
+        for m in re.finditer(r'"?([A-Z_][A-Z0-9_]*)"?', order_match.group(1)):
+            col = m.group(1)
+            if col not in RESERVED and col not in ("ASC", "DESC"):
+                result["order_columns"].append(col)
+
+    # --- JOIN key columns ---
+    for m in re.finditer(
+        r'\bON\b\s+"?([A-Z_][A-Z0-9_.]*)"?\s*=\s*"?([A-Z_][A-Z0-9_.]*)"?',
+        sql_upper
+    ):
+        left  = m.group(1).split(".")[-1]
+        right = m.group(2).split(".")[-1]
+        if left  not in RESERVED: result["join_columns"].append(left)
+        if right not in RESERVED: result["join_columns"].append(right)
+
+    return result
+
+
+# ============================================================
+# JOIN RECIPE ANALYSER
+# Reads Dataiku join recipe structure.
+# Confirmed from Dataiku API source code and documentation.
+# Join payload stored in recipe["joins"] and recipe["json_payload"]
+# ============================================================
+
+def analyze_join_recipe(recipe_data):
+    """
+    Extract join keys and selected columns from a Dataiku Join recipe.
+    Reads from both recipe["joins"] (direct) and recipe["json_payload"].
+    """
+    result = {
+        "join_type":        "unknown",
+        "join_keys":        [],
+        "left_input":       recipe_data.get("inputs", [None])[0],
+        "right_inputs":     recipe_data.get("inputs", [])[1:],
+        "outputs":          recipe_data.get("outputs", []),
+        "selected_columns": []
+    }
+
+    # Method 1: joins array captured directly by Phase 1 scanner
+    joins_direct = recipe_data.get("joins", [])
+    if isinstance(joins_direct, list) and joins_direct:
+        for join in joins_direct:
+            if not isinstance(join, dict):
+                continue
+            jtype = join.get("type", "")
+            if jtype:
+                result["join_type"] = jtype
+            for cond in join.get("on", []):
+                if not isinstance(cond, dict):
+                    continue
+                col1  = cond.get("column1", {})
+                col2  = cond.get("column2", {})
+                left  = col1.get("name", "") if isinstance(col1, dict) else str(col1)
+                right = col2.get("name", "") if isinstance(col2, dict) else str(col2)
+                if left or right:
+                    result["join_keys"].append({
+                        "left":      left,
+                        "right":     right,
+                        "condition": cond.get("type", "EQ")
+                    })
+
+    # Method 2: json_payload (alternate / supplementary location)
+    payload = recipe_data.get("json_payload", {})
+    if isinstance(payload, dict):
+        if result["join_type"] == "unknown":
+            result["join_type"] = payload.get("joinType", "unknown")
+
+        if not result["join_keys"]:
+            for join in payload.get("joins", []):
+                if not isinstance(join, dict):
+                    continue
+                for cond in join.get("on", []):
+                    if not isinstance(cond, dict):
+                        continue
+                    col1  = cond.get("column1", {})
+                    col2  = cond.get("column2", {})
+                    left  = col1.get("name", "") if isinstance(col1, dict) else str(col1)
+                    right = col2.get("name", "") if isinstance(col2, dict) else str(col2)
+                    result["join_keys"].append({
+                        "left":      left,
+                        "right":     right,
+                        "condition": "EQ"
+                    })
+
+        for col in payload.get("selectedColumns", []):
+            if isinstance(col, dict) and col.get("name"):
+                result["selected_columns"].append({
+                    "name":  col["name"],
+                    "table": col.get("tableReference", {}).get("table", ""),
+                    "type":  col.get("type", "")
+                })
+
+    return result
+
+
+# ============================================================
+# PYTHON / PYSPARK ANALYSER
+# Extracts column references and operations from Python code.
+# ============================================================
+
+def analyze_python_recipe(code_text):
+    """
+    Extract column references and Spark operations from Python/PySpark code.
+    """
+    if not code_text:
+        return {"columns_referenced": [], "operations": []}
+
+    result = {"columns_referenced": [], "operations": []}
+
+    patterns = [
+        r'df\s*\[["\'`]([^"\'`]+)["\'`]\]',
+        r'\.select\s*\(\s*["\'`]([^"\'`]+)["\'`]',
+        r'\.filter\s*\(\s*["\'`]([^"\'`]+)["\'`]',
+        r'\.withColumn\s*\(\s*["\'`]([^"\'`]+)["\'`]',
+        r'\.groupBy\s*\(\s*["\'`]([^"\'`]+)["\'`]',
+        r'\bcol\s*\(\s*["\'`]([^"\'`]+)["\'`]\)',
+        r'\bF\.col\s*\(\s*["\'`]([^"\'`]+)["\'`]\)',
+        r'\.drop\s*\(\s*["\'`]([^"\'`]+)["\'`]\)',
+        r'\.orderBy\s*\(\s*["\'`]([^"\'`]+)["\'`]\)',
+        r'\.sort\s*\(\s*["\'`]([^"\'`]+)["\'`]\)',
+    ]
+
+    for pattern in patterns:
+        for m in re.finditer(pattern, code_text, re.IGNORECASE):
+            col = m.group(1).strip()
+            if col and col not in result["columns_referenced"]:
+                result["columns_referenced"].append(col)
+
+    op_patterns = [
+        (r'\.groupBy\s*\(',    "GROUP_BY"),
+        (r'\.agg\s*\(',        "AGGREGATION"),
+        (r'\.join\s*\(',       "JOIN"),
+        (r'\.filter\s*\(',     "FILTER"),
+        (r'\.where\s*\(',      "FILTER"),
+        (r'\.withColumn\s*\(', "TRANSFORM"),
+        (r'\.select\s*\(',     "SELECT"),
+        (r'\.drop\s*\(',       "DROP"),
+        (r'\.dropDuplicates\s*\(', "DEDUP"),
+        (r'\.union\s*\(',      "UNION"),
+        (r'\.distinct\s*\(',   "DISTINCT"),
+        (r'\.orderBy\s*\(',    "ORDER"),
+        (r'\.sort\s*\(',       "ORDER"),
+        (r'\.fillna\s*\(',     "FILL_NA"),
+        (r'\.fillNull\s*\(',   "FILL_NULL"),
+        (r'\.pivot\s*\(',      "PIVOT"),
+    ]
+
+    for pattern, op_name in op_patterns:
+        if re.search(pattern, code_text, re.IGNORECASE):
+            if op_name not in result["operations"]:
+                result["operations"].append(op_name)
+
+    return result
+
+
+# ============================================================
+# GROUP / AGGREGATION RECIPE ANALYSER
+# Confirmed from Dataiku docs:
+# json_payload has "keys" (group by) and "values" (aggregations)
+# ============================================================
+
+def analyze_group_recipe(recipe_data):
+    """
+    Extract group keys and aggregations from a Dataiku Group recipe.
+    """
+    result = {
+        "group_keys":   [],
+        "aggregations": [],
+        "all_columns":  []
+    }
+
+    # payload = recipe_data.get("json_payload", {})
+    payload = (
+    recipe_data.get("json_payload")
+    or recipe_data.get("raw_definition")
+    or recipe_data.get("payload")
+    or {}
+    )
+    if not isinstance(payload, dict):
+        return result
+
+    for key in payload.get("keys", []):
+        if isinstance(key, dict):
+            col = key.get("column", "")
+            if col:
+                result["group_keys"].append(col)
+                result["all_columns"].append(col)
+
+    agg_types = [
+        "sum", "count", "avg", "min", "max",
+        "stddev", "count_distinct", "first", "last",
+        "median", "variance", "percentile25", "percentile75"
+    ]
+    for val in payload.get("values", []):
+        if isinstance(val, dict):
+            col  = val.get("column", "")
+            aggs = [a.upper() for a in agg_types if val.get(a)]
+            if col:
+                result["aggregations"].append({
+                    "column":       col,
+                    "aggregations": aggs
+                })
+                result["all_columns"].append(col)
+
+    return result
+
+
+# ============================================================
+# WINDOW RECIPE ANALYSER
+# Confirmed from Dataiku WindowRecipeSettings docs.
+# ============================================================
+
+def analyze_window_recipe(recipe_data):
+    """
+    Extract partition, order, and window function columns
+    from a Dataiku Window recipe.
+    """
+    result = {
+        "partition_by":   [],
+        "order_by":       [],
+        "window_columns": [],
+        "all_columns":    []
+    }
+
+    payload = recipe_data.get("json_payload", {})
+    if not isinstance(payload, dict):
+        return result
+
+    win_def = payload.get("windowDefinitions", {})
+    if isinstance(win_def, dict):
+        for col in win_def.get("partitioning", []):
+            if isinstance(col, dict):
+                col_name = col.get("column", "")
+                if col_name:
+                    result["partition_by"].append(col_name)
+                    result["all_columns"].append(col_name)
+
+        for col in win_def.get("ordering", []):
+            if isinstance(col, dict):
+                col_name = col.get("column", "")
+                if col_name:
+                    result["order_by"].append(col_name)
+                    result["all_columns"].append(col_name)
+
+    for col in payload.get("computedColumns", []):
+        if isinstance(col, dict):
+            col_name = col.get("name", "")
+            if col_name:
+                result["window_columns"].append({
+                    "name": col_name,
+                    "mode": col.get("mode", "")
+                })
+                result["all_columns"].append(col_name)
+
+    return result
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def run_phase3():
+
+    print("=" * 80)
+    print("ARIS v1.0 | Phase 3 - Code Intelligence")
+    print("=" * 80)
+    print(f"Project      : {PROJECT_KEY}")
+    print(f"Started      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 80)
+
+    print("\nLoading Phase 1 outputs...")
+
+    recipe_data  = load_json(RECIPE_INTELLIGENCE_FILE)
+    dataset_data = load_json(DATASET_REGISTRY_FILE)
+
+    generated_at_str = recipe_data.get("generated_at")
+    if generated_at_str:
+        try:
+            generated_at = datetime.fromisoformat(generated_at_str)
+            age_days = (datetime.now() - generated_at).days
+            if age_days > STALE_AFTER_DAYS:
+                print(f"[WARNING] Context is {age_days} days old. Consider re-running Phase 1.")
+            else:
+                print(f"[OK] Context age: {age_days} day(s)")
+        except Exception:
+            pass
+
+    recipes  = recipe_data.get("recipes", [])
+    datasets = dataset_data.get("datasets", {})
+
+    print(f"[OK] Loaded {len(recipes)} recipes | {len(datasets)} datasets")
+
+    print(f"\nAnalysing code in {len(recipes)} recipes...")
+
+    recipe_analyses = []
+    column_index    = {}
+    error_count     = 0
+    success_count   = 0
+
+    for index, recipe in enumerate(recipes):
+
+        name    = recipe.get("recipe_name", "")
+        rtype   = recipe.get("recipe_type", "unknown")
+        inputs  = recipe.get("inputs",  [])
+        outputs = recipe.get("outputs", [])
+        payload = recipe.get("payload", "") or ""
+        code    = recipe.get("code",    "") or ""
+
+        print(f"  [{index+1:>3}/{len(recipes)}] {name[:55]:<55}", end="\r")
+
+        analysis = {
+            "recipe_name":           name,
+            "recipe_type":           rtype,
+            "inputs":                inputs,
+            "outputs":               outputs,
+            "code_present":          bool(payload or code),
+            "code_length":           len(payload or code),
+            "sql_analysis":          {},
+            "join_analysis": {
+                                "join_type": "...",
+                                "join_keys": [...]},
+            "python_analysis":       {},
+            "group_analysis":        {},
+            "window_analysis":       {},
+            "columns_by_behavior":   {},
+            "all_columns_referenced":[],
+            "recipe_summary":        ""
+        }
+
+        # ----------------------------------------------------------
+        # SQL RECIPES
+        # ----------------------------------------------------------
+        if rtype in ("sql_query", "sql_script", "hive", "spark_sql"):
+
+            if payload:
+                try:
+                    sql_analysis = extract_columns_from_sql(payload)
+                    analysis["sql_analysis"] = sql_analysis
+
+                    behaviors = {}
+                    all_cols  = set()
+
+                    for col_entry in sql_analysis.get("select_columns", []):
+                        source = col_entry.get("source", "")
+                        alias  = col_entry.get("alias",  "")
+                        is_tx  = col_entry.get("transformed", False)
+                        key    = alias or source
+                        all_cols.add(key)
+                        behaviors[key] = "TRANSFORMED" if is_tx else "PASSTHROUGH"
+
+                    for agg in sql_analysis.get("aggregate_columns", []):
+                        col = agg["column"]
+                        behaviors[col] = "AGGREGATED"
+                        all_cols.add(col)
+
+                    for col in sql_analysis.get("case_columns", []):
+                        behaviors[col] = "CALCULATED"
+                        all_cols.add(col)
+
+                    for col in sql_analysis.get("join_columns", []):
+                        if col not in behaviors:
+                            behaviors[col] = "JOIN_KEY"
+                        all_cols.add(col)
+
+                    for col in sql_analysis.get("group_columns", []):
+                        if col not in behaviors:
+                            behaviors[col] = "GROUPED"
+                        all_cols.add(col)
+
+                    for col in sql_analysis.get("where_columns", []):
+                        if col not in behaviors:
+                            behaviors[col] = "FILTER_RULE"
+                        all_cols.add(col)
+
+                    analysis["columns_by_behavior"]     = behaviors
+                    analysis["all_columns_referenced"]  = list(all_cols)
+
+                    sc = len(sql_analysis.get("select_columns",    []))
+                    wc = len(sql_analysis.get("where_columns",     []))
+                    ac = len(sql_analysis.get("aggregate_columns", []))
+                    jc = len(sql_analysis.get("join_columns",      []))
+                    gc = len(sql_analysis.get("group_columns",     []))
+
+                    parts = [f"{sc} SELECT columns"]
+                    if wc: parts.append(f"{wc} WHERE filters")
+                    if ac: parts.append(f"{ac} aggregations")
+                    if jc: parts.append(f"{jc} JOIN keys")
+                    if gc: parts.append(f"{gc} GROUP BY")
+
+                    analysis["recipe_summary"] = (
+                        f"SQL recipe with {', '.join(parts)}. "
+                        f"Reads from: {', '.join(inputs[:3])}. "
+                        f"Writes to: {', '.join(outputs[:3])}."
+                    )
+
+                    for col, behavior in behaviors.items():
+                        update_column_index(column_index, col, name, rtype, behavior)
+
+                    success_count += 1
+
+                except Exception as e:
+                    analysis["error"] = str(e)
+                    error_count += 1
+            else:
+                analysis["recipe_summary"] = "SQL recipe — no payload captured. Re-run Phase 1."
+                analysis["warning"] = "No SQL payload available"
+
+        # ----------------------------------------------------------
+        # JOIN RECIPES
+        # ----------------------------------------------------------
+        elif rtype == "join":
+            try:
+                join_analysis = analyze_join_recipe(recipe)
+                analysis["join_analysis"] = join_analysis
+
+                all_cols = set()
+
+                for jk in join_analysis.get("join_keys", []):
+                    left  = jk.get("left",  "")
+                    right = jk.get("right", "")
+                    if left:
+                        all_cols.add(left)
+                        analysis["columns_by_behavior"][left] = "JOIN_KEY"
+                        update_column_index(column_index, left, name, rtype, "JOIN_KEY")
+                    if right:
+                        all_cols.add(right)
+                        analysis["columns_by_behavior"][right] = "JOIN_KEY"
+                        update_column_index(column_index, right, name, rtype, "JOIN_KEY")
+
+                for col_info in join_analysis.get("selected_columns", []):
+                    col = col_info.get("name", "")
+                    if col:
+                        all_cols.add(col)
+                        if col not in analysis["columns_by_behavior"]:
+                            analysis["columns_by_behavior"][col] = "PASSTHROUGH"
+                            update_column_index(column_index, col, name, rtype, "PASSTHROUGH")
+
+                analysis["all_columns_referenced"] = list(all_cols)
+
+                left_input   = join_analysis.get("left_input",   "")
+                right_inputs = join_analysis.get("right_inputs", [])
+                join_keys    = join_analysis.get("join_keys",    [])
+                sel_cols     = join_analysis.get("selected_columns", [])
+
+                analysis["recipe_summary"] = (
+                    f"Join recipe ({join_analysis.get('join_type','unknown')} join). "
+                    f"Left: {left_input}. "
+                    f"Right: {', '.join(right_inputs[:2])}. "
+                    f"Join keys: {len(join_keys)}. "
+                    f"Output columns: {len(sel_cols)}."
+                )
+
+                success_count += 1
+
+            except Exception as e:
+                analysis["error"] = str(e)
+                error_count += 1
+
+        # ----------------------------------------------------------
+        # PYTHON / PYSPARK / R RECIPES
+        # ----------------------------------------------------------
+        elif rtype in ("python", "pyspark", "r"):
+
+            code_text = code or payload
+            if code_text:
+                try:
+                    python_analysis = analyze_python_recipe(code_text)
+                    analysis["python_analysis"] = python_analysis
+
+                    all_cols = set(python_analysis.get("columns_referenced", []))
+                    analysis["all_columns_referenced"] = list(all_cols)
+
+                    for col in all_cols:
+                        analysis["columns_by_behavior"][col] = "REFERENCED"
+                        update_column_index(column_index, col, name, rtype, "REFERENCED")
+
+                    ops = python_analysis.get("operations", [])
+                    analysis["recipe_summary"] = (
+                        f"Python/PySpark recipe. "
+                        f"Operations: {', '.join(ops) if ops else 'see code'}. "
+                        f"Columns referenced: {len(all_cols)}. "
+                        f"Reads from: {', '.join(inputs[:3])}. "
+                        f"Writes to: {', '.join(outputs[:3])}."
+                    )
+                    success_count += 1
+
+                except Exception as e:
+                    analysis["error"] = str(e)
+                    error_count += 1
+            else:
+                analysis["recipe_summary"] = "Python recipe — no code captured. Re-run Phase 1."
+                analysis["warning"] = "No code payload available"
+
+        # ----------------------------------------------------------
+        # GROUP / AGGREGATION RECIPES
+        # ----------------------------------------------------------
+        elif rtype in ("grouping", "group"):
+            try:
+                group_analysis = analyze_group_recipe(recipe)
+                analysis["group_analysis"] = group_analysis
+
+                all_cols = set(group_analysis.get("all_columns", []))
+                analysis["all_columns_referenced"] = list(all_cols)
+
+                for col in group_analysis.get("group_keys", []):
+                    analysis["columns_by_behavior"][col] = "GROUPED"
+                    update_column_index(column_index, col, name, rtype, "GROUPED")
+
+                for agg in group_analysis.get("aggregations", []):
+                    col = agg["column"]
+                    analysis["columns_by_behavior"][col] = "AGGREGATED"
+                    update_column_index(column_index, col, name, rtype, "AGGREGATED")
+
+                keys = group_analysis.get("group_keys",   [])
+                aggs = group_analysis.get("aggregations", [])
+                analysis["recipe_summary"] = (
+                    f"Group/Aggregation recipe. "
+                    f"Group by: {', '.join(keys[:5]) if keys else 'none'}. "
+                    f"Aggregations: {len(aggs)} columns. "
+                    f"Reads from: {', '.join(inputs[:3])}. "
+                    f"Writes to: {', '.join(outputs[:3])}."
+                )
+                success_count += 1
+
+            except Exception as e:
+                analysis["error"] = str(e)
+                error_count += 1
+
+        # ----------------------------------------------------------
+        # WINDOW RECIPES
+        # ----------------------------------------------------------
+        elif rtype == "window":
+            try:
+                window_analysis = analyze_window_recipe(recipe)
+                analysis["window_analysis"] = window_analysis
+
+                all_cols = set(window_analysis.get("all_columns", []))
+                analysis["all_columns_referenced"] = list(all_cols)
+
+                for col in window_analysis.get("partition_by", []):
+                    analysis["columns_by_behavior"][col] = "PARTITION_KEY"
+                    update_column_index(column_index, col, name, rtype, "PARTITION_KEY")
+
+                for col in window_analysis.get("order_by", []):
+                    analysis["columns_by_behavior"][col] = "ORDER_KEY"
+                    update_column_index(column_index, col, name, rtype, "ORDER_KEY")
+
+                for w in window_analysis.get("window_columns", []):
+                    col = w.get("name", "")
+                    analysis["columns_by_behavior"][col] = "WINDOW_FUNCTION"
+                    update_column_index(column_index, col, name, rtype, "WINDOW_FUNCTION")
+
+                partition = window_analysis.get("partition_by",   [])
+                ordering  = window_analysis.get("order_by",       [])
+                windows   = window_analysis.get("window_columns", [])
+                analysis["recipe_summary"] = (
+                    f"Window recipe. "
+                    f"Partition by: {', '.join(partition[:3]) if partition else 'none'}. "
+                    f"Order by: {', '.join(ordering[:3]) if ordering else 'none'}. "
+                    f"Window functions: {len(windows)}. "
+                    f"Reads from: {', '.join(inputs[:3])}. "
+                    f"Writes to: {', '.join(outputs[:3])}."
+                )
+                success_count += 1
+
+            except Exception as e:
+                analysis["error"] = str(e)
+                error_count += 1
+
+        # ----------------------------------------------------------
+        # ALL OTHER RECIPE TYPES
+        # Stack, Split, Distinct, TopN, Prepare, Sync, etc.
+        # Store inputs/outputs for lineage — no deep code analysis
+        # ----------------------------------------------------------
+        else:
+            analysis["recipe_summary"] = (
+                f"Recipe type '{rtype}'. "
+                f"Reads from: {', '.join(inputs[:3]) if inputs else 'none'}. "
+                f"Writes to: {', '.join(outputs[:3]) if outputs else 'none'}."
+            )
+            success_count += 1
+
+        recipe_analyses.append(analysis)
+
+    print(f"\n[OK] Analysed: {success_count} | [ERROR] {error_count}")
+
+    # ----------------------------------------------------------
+    # STATISTICS
+    # ----------------------------------------------------------
+    behavior_counts    = {}
+    recipe_type_counts = {}
+
+    for a in recipe_analyses:
+        rt = a.get("recipe_type", "unknown")
+        recipe_type_counts[rt] = recipe_type_counts.get(rt, 0) + 1
+        for col, behavior in a.get("columns_by_behavior", {}).items():
+            behavior_counts[behavior] = behavior_counts.get(behavior, 0) + 1
+
+    col_frequency = {col: len(occ) for col, occ in column_index.items()}
+    top_columns   = sorted(col_frequency.items(), key=lambda x: -x[1])[:20]
+
+    # ----------------------------------------------------------
+    # BUILD JSON OUTPUTS
+    # ----------------------------------------------------------
+    ARIS_METADATA = {
+        "aris_version":    "1.0",
+        "phase":           "Phase 3 - Code Intelligence",
+        "project":         PROJECT_KEY,
+        "generated_at":    datetime.now().isoformat(timespec="seconds"),
+        "stale_after_days": STALE_AFTER_DAYS
+    }
+
+    code_intelligence = {
+        **ARIS_METADATA,
+        "analysis_summary": {
+            "total_recipes":          len(recipes),
+            "recipes_analysed":       success_count,
+            "recipes_with_errors":    error_count,
+            "recipe_type_breakdown":  recipe_type_counts,
+            "behavior_counts":        behavior_counts,
+            "unique_columns_found":   len(column_index),
+            "top_columns_by_frequency": [
+                {"column": col, "recipe_count": count}
+                for col, count in top_columns
+            ]
+        },
+        "recipe_analyses": recipe_analyses
+    }
+
+    column_index_output = {
+        **ARIS_METADATA,
+        "phase":        "Phase 3 - Column Index",
+        "description":  "Every column found across all recipes with behavior in each recipe.",
+        "column_count": len(column_index),
+        "columns":      column_index
+    }
+
+    # ----------------------------------------------------------
+    # BUILD MARKDOWN FOR LLM
+    # ----------------------------------------------------------
+    def build_code_md(data):
+        lines = []
+        lines.append("# ARIS Code Intelligence")
+        lines.append(f"\n**Project:** {data['project']}")
+        lines.append(f"**Generated:** {data['generated_at']}")
+        lines.append(f"\n> Give this file to Claude or Copilot alongside the other ARIS files.")
+        lines.append(f"> With this file the LLM knows exactly how every recipe handles every column.")
+
+        s = data["analysis_summary"]
+        lines.append("\n---\n## Summary\n")
+        lines.append("| Metric | Value |")
+        lines.append("|---|---|")
+        lines.append(f"| Recipes analysed | {s['recipes_analysed']} |")
+        lines.append(f"| Unique columns found | {s['unique_columns_found']} |")
+        lines.append(f"| Recipes with errors | {s['recipes_with_errors']} |")
+
+        lines.append("\n**Recipe type breakdown:**")
+        for rt, count in sorted(s.get("recipe_type_breakdown", {}).items()):
+            lines.append(f"- {rt}: {count}")
+
+        lines.append("\n**Column behavior distribution:**")
+        for behavior, count in sorted(
+            s.get("behavior_counts", {}).items(), key=lambda x: -x[1]
+        ):
+            lines.append(f"- {behavior}: {count}")
+
+        lines.append("\n**Top columns (most widely used):**")
+        for item in s.get("top_columns_by_frequency", [])[:15]:
+            lines.append(f"- `{item['column']}` — {item['recipe_count']} recipe(s)")
+
+        lines.append("\n---\n## Recipe Code Analysis\n")
+
+        for a in data.get("recipe_analyses", []):
+            name    = a.get("recipe_name", "")
+            rtype   = a.get("recipe_type", "")
+            inputs  = a.get("inputs",  [])
+            outputs = a.get("outputs", [])
+            summary = a.get("recipe_summary", "")
+            behav   = a.get("columns_by_behavior", {})
+            warning = a.get("warning", "")
+            error   = a.get("error",   "")
+
+            lines.append(f"### {name}")
+            lines.append(
+                f"**Type:** {rtype} | "
+                f"**In:** {', '.join(inputs[:3]) or 'none'} | "
+                f"**Out:** {', '.join(outputs[:3]) or 'none'}"
+            )
+            if summary:
+                lines.append(f"\n{summary}")
+            if warning:
+                lines.append(f"\n> [WARNING] {warning}")
+            if error:
+                lines.append(f"\n> [ERROR] {error}")
+
+            if behav:
+                lines.append("\n| Column | Behavior |")
+                lines.append("|---|---|")
+                for col, behavior in sorted(behav.items()):
+                    lines.append(f"| `{col}` | {behavior} |")
+
+            # Python ops
+            pa = a.get("python_analysis", {})
+            if pa.get("operations"):
+                lines.append(f"\n**Operations:** {', '.join(pa['operations'])}")
+            if pa.get("columns_referenced"):
+                cols = pa["columns_referenced"][:8]
+                lines.append(f"\n**Columns:** {', '.join([f'`{c}`' for c in cols])}")
+
+            # Join keys
+            ja = a.get("join_analysis", {})
+            if ja.get("join_keys"):
+                lines.append("\n**Join keys:**")
+                for jk in ja["join_keys"]:
+                    lines.append(f"- `{jk['left']}` = `{jk['right']}`")
+
+            # Group
+            ga = a.get("group_analysis", {})
+            if ga.get("group_keys"):
+                lines.append(f"\n**Group by:** {', '.join([f'`{k}`' for k in ga['group_keys']])}")
+            if ga.get("aggregations"):
+                lines.append("**Aggregations:**")
+                for agg in ga["aggregations"]:
+                    lines.append(f"- `{agg['column']}`: {', '.join(agg['aggregations'])}")
+
+            # Window
+            wa = a.get("window_analysis", {})
+            if wa.get("partition_by"):
+                lines.append(f"\n**Partition by:** {', '.join([f'`{c}`' for c in wa['partition_by']])}")
+            if wa.get("order_by"):
+                lines.append(f"**Order by:** {', '.join([f'`{c}`' for c in wa['order_by']])}")
+
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def build_sql_md(all_recipes):
+        lines = []
+        lines.append("# ARIS SQL Summary")
+        lines.append(f"\n**Project:** {PROJECT_KEY}")
+        lines.append(f"**Generated:** {datetime.now().isoformat(timespec='seconds')}")
+        lines.append(f"\n> All SQL recipe code in one file for LLM reference.")
+        lines.append(f"> Give this to Claude or Copilot to answer questions about specific SQL logic.\n")
+
+        sql_count = 0
+        for recipe in all_recipes:
+            rtype   = recipe.get("recipe_type", "")
+            name    = recipe.get("recipe_name", "")
+            payload = recipe.get("payload", "") or ""
+            inputs  = recipe.get("inputs",  [])
+            outputs = recipe.get("outputs", [])
+
+            if rtype not in ("sql_query", "sql_script", "hive", "spark_sql"):
+                continue
+            if not payload:
+                continue
+
+            sql_count += 1
+            lines.append(f"## {name}")
+            lines.append(f"**Type:** {rtype}")
+            lines.append(f"**Reads from:** {', '.join(inputs)}")
+            lines.append(f"**Writes to:** {', '.join(outputs)}")
+            lines.append(f"\n```sql\n{payload.strip()}\n```\n")
+
+        lines.insert(4, f"**Total SQL recipes with code:** {sql_count}\n")
+        return "\n".join(lines)
+
+    code_md = build_code_md(code_intelligence)
+    sql_md  = build_sql_md(recipes)
+
+    # ----------------------------------------------------------
+    # SAVE
+    # ----------------------------------------------------------
+    print("\nSaving outputs...")
+    save_json(CODE_INTELLIGENCE_FILE, code_intelligence)
+    save_json(COLUMN_INDEX_FILE,      column_index_output)
+    save_text(CODE_INTELLIGENCE_MD,   code_md)
+    save_text(SQL_SUMMARY_MD,         sql_md)
+
+    # ----------------------------------------------------------
+    # FINAL STATUS
+    # ----------------------------------------------------------
+    print("\n")
+    print("=" * 80)
+    print("ARIS Phase 3 Complete - Code Intelligence")
+    print("=" * 80)
+    print(f"Project              : {PROJECT_KEY}")
+    print(f"Completed            : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Recipes analysed     : {success_count}")
+    if error_count:
+        print(f"Recipes with errors  : {error_count}")
+    print(f"Unique columns found : {len(column_index)}")
+    print()
+    print("Recipe type breakdown:")
+    for rt, count in sorted(recipe_type_counts.items()):
+        print(f"  {rt:<25} : {count}")
+    print()
+    print("Column behavior distribution:")
+    for behavior, count in sorted(behavior_counts.items(), key=lambda x: -x[1]):
+        print(f"  {behavior:<20} : {count}")
+    print()
+    print("Top 10 columns (most widely used):")
+    for col, count in top_columns[:10]:
+        print(f"  {col:<35} : {count} recipe(s)")
+    print()
+    print(f"Output files in: {LOCAL_OUTPUT_DIR}\\")
+    print(f"  [SAVED] {CODE_INTELLIGENCE_FILE}")
+    print(f"  [SAVED] {CODE_INTELLIGENCE_MD}")
+    print(f"  [SAVED] {COLUMN_INDEX_FILE}")
+    print(f"  [SAVED] {SQL_SUMMARY_MD}")
+    print()
+    print("Give these files to Claude or Copilot:")
+    print(f"  1. {CODE_INTELLIGENCE_MD}  -> how every recipe works")
+    print(f"  2. {SQL_SUMMARY_MD}        -> all actual SQL code")
+    print(f"  3. {OUTPUT_PREFIX}DESIGN_CONTEXT.md -> Visio business rules")
+    print()
+    print("Ask questions like:")
+    print('  "Which recipes transform the BRAND column?"')
+    print('  "Show me the SQL that filters by STATE"')
+    print('  "Is the email check rule from Visio implemented in the pipeline?"')
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    run_phase3()
