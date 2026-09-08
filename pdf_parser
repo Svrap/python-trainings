@@ -1,0 +1,845 @@
+# ============================================================
+# ARIS Visio PDF Converter
+# Parses a business flow PDF (exported from Visio) and
+# extracts structured business rules, filter conditions,
+# flow logic, and version history into machine-readable JSON.
+#
+# RUN FROM PROJECT ROOT:
+# python visio_converter\pdf_converter.py
+#
+# CONFIGURE:
+# Set PDF_FILENAME and FLOW_NAME in config\aris_config.py
+# Place your PDF file in the pdfs\ folder
+#
+# VISIO STRUCTURE SUPPORTED:
+# - Rounded rectangle (top) = Campaign/source metadata
+# - Diamond = Decision / filter condition (YES/NO)
+# - Rectangle = Process / action step
+# - Hexagon = END / STOP state
+# - Information box = Notes and reference rules
+# - Version history table = outside-flow document metadata
+# - Arrow labels: YES (continue) / NO (exclude/branch)
+# ============================================================
+
+import pdfplumber
+import json
+import os
+import re
+import sys
+from datetime import datetime
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from config.aris_config import (
+    PROJECT_KEY,
+    LOCAL_OUTPUT_DIR,
+    LOCAL_PDF_DIR,
+    PDF_FILENAME,
+    FLOW_NAME,
+    SQL_CONFIDENCE,
+    DESIGN_CONTEXT_FILE,
+    DESIGN_CONTEXT_MD,
+    output_path,
+    pdf_path
+)
+
+# ============================================================
+# STEP 1 - EXTRACT ALL TEXT BLOCKS WITH POSITIONS
+# ============================================================
+
+def extract_text_blocks(pdf_path_str):
+    """
+    Extract all text from PDF with bounding box coordinates.
+    Groups nearby words into logical text blocks.
+    Returns list of blocks sorted top to bottom.
+    """
+    blocks = []
+
+    with pdfplumber.open(pdf_path_str) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+
+            words = page.extract_words(
+                x_tolerance=5,
+                y_tolerance=5,
+                keep_blank_chars=False
+            )
+
+            if not words:
+                continue
+
+            words_sorted = sorted(
+                words,
+                key=lambda w: (round(w["top"] / 8), w["x0"])
+            )
+
+            current_block = None
+
+            for word in words_sorted:
+                text = word["text"].strip()
+                if not text:
+                    continue
+
+                if current_block is None:
+                    current_block = {
+                        "text": text,
+                        "x0":   word["x0"],
+                        "y0":   word["top"],
+                        "x1":   word["x1"],
+                        "y1":   word["bottom"],
+                        "page": page_num
+                    }
+                else:
+                    same_line   = abs(word["top"] - current_block["y0"]) < 12
+                    close_horiz = word["x0"] - current_block["x1"] < 60
+
+                    if same_line and close_horiz:
+                        current_block["text"] += " " + text
+                        current_block["x1"]    = word["x1"]
+                        current_block["y1"]    = max(current_block["y1"], word["bottom"])
+                    else:
+                        if current_block["text"].strip():
+                            current_block["center_x"] = (current_block["x0"] + current_block["x1"]) / 2
+                            current_block["center_y"] = (current_block["y0"] + current_block["y1"]) / 2
+                            blocks.append(current_block)
+
+                        current_block = {
+                            "text": text,
+                            "x0":   word["x0"],
+                            "y0":   word["top"],
+                            "x1":   word["x1"],
+                            "y1":   word["bottom"],
+                            "page": page_num
+                        }
+
+            if current_block and current_block["text"].strip():
+                current_block["center_x"] = (current_block["x0"] + current_block["x1"]) / 2
+                current_block["center_y"] = (current_block["y0"] + current_block["y1"]) / 2
+                blocks.append(current_block)
+
+    blocks.sort(key=lambda b: (b.get("page", 0), b["y0"]))
+    return blocks
+
+
+# ============================================================
+# STEP 2 - EXTRACT VERSION HISTORY TABLE
+#
+# The version history table appears outside the main flow.
+# It typically contains columns: Version, Date, Description, Author
+# Located at bottom of page or on a separate section.
+# ============================================================
+
+def extract_version_history(blocks):
+    """
+    Detect and extract version history table entries from text blocks.
+    Looks for patterns like version numbers (1.0, 1.1, 2.0) near dates.
+    Returns list of version entries.
+    """
+    version_entries = []
+
+    # Version number pattern: 1.0, 1.1, 2.0, v1.0 etc.
+    version_pattern = re.compile(r'^[Vv]?\d+\.\d+$')
+    # Date pattern: MM/DD/YYYY, YYYY-MM-DD, DD-MMM-YYYY
+    date_pattern = re.compile(
+        r'\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[\/\-]\d{2}[\/\-]\d{2}|'
+        r'\d{1,2}[\/\-][A-Za-z]{3}[\/\-]\d{2,4})\b'
+    )
+
+    # Find blocks that look like version numbers
+    version_blocks = [
+        b for b in blocks
+        if version_pattern.match(b["text"].strip())
+    ]
+
+    for vb in version_blocks:
+        version_num = vb["text"].strip()
+        v_y = vb["y0"]
+        v_x = vb["x0"]
+
+        # Look for nearby blocks on the same horizontal band
+        nearby = [
+            b for b in blocks
+            if abs(b["y0"] - v_y) < 20
+            and b["x0"] > v_x
+            and b["text"].strip() != version_num
+        ]
+
+        nearby_sorted = sorted(nearby, key=lambda b: b["x0"])
+
+        date_found   = None
+        desc_found   = None
+        author_found = None
+
+        for nb in nearby_sorted:
+            text = nb["text"].strip()
+            if not date_found and date_pattern.search(text):
+                date_found = text
+            elif not desc_found and len(text) > 10:
+                desc_found = text
+            elif not author_found and len(text) > 2:
+                author_found = text
+
+        version_entries.append({
+            "version":     version_num,
+            "date":        date_found or "unknown",
+            "description": desc_found or "no description",
+            "author":      author_found or "unknown"
+        })
+
+    # Also look for legend/responsibility sections
+    legend_blocks = []
+    responsibility_blocks = []
+
+    for block in blocks:
+        text_upper = block["text"].upper()
+        if any(k in text_upper for k in ["LEGEND", "RESPONSIBILITY", "PREPARED BY",
+                                          "APPROVED BY", "REVIEWED BY"]):
+            if "LEGEND" in text_upper:
+                legend_blocks.append(block["text"])
+            else:
+                responsibility_blocks.append(block["text"])
+
+    return {
+        "versions":         version_entries,
+        "legend_notes":     legend_blocks,
+        "responsibility":   responsibility_blocks
+    }
+
+
+# ============================================================
+# STEP 3 - CLASSIFY EACH TEXT BLOCK BY SHAPE TYPE
+# ============================================================
+
+def classify_block(block, all_blocks):
+    """
+    Classify text block as one of:
+    METADATA    - campaign/source info at top
+    DECISION    - filter rule / condition (diamond)
+    PROCESS     - action step (rectangle)
+    CONNECTOR   - YES/NO arrow label
+    END         - STOP / end state (hexagon)
+    VERSION     - version history entry
+    NOTES       - reference info, legends, outside-flow metadata
+    """
+    text       = block["text"].strip()
+    text_upper = text.upper()
+    y_pos      = block["y0"]
+
+    all_y      = [b["y0"] for b in all_blocks]
+    min_y      = min(all_y) if all_y else 0
+    max_y      = max(all_y) if all_y else 1000
+    page_height = max_y - min_y
+    relative_y  = (y_pos - min_y) / page_height if page_height > 0 else 0
+
+    # CONNECTOR labels
+    if text_upper in ("YES", "NO", "Y", "N"):
+        return "CONNECTOR"
+
+    # END / STOP states
+    if text_upper in ("STOP", "END", "FINISH", "DONE", "EXIT"):
+        return "END"
+    if any(k in text_upper for k in ["ELIGIBLE LIST", "SUPPRESSED LIST",
+                                      "FINAL OUTPUT", "COMPLETED"]):
+        return "END"
+
+    # VERSION entries
+    version_pattern = re.compile(r'^[Vv]?\d+\.\d+$')
+    if version_pattern.match(text):
+        return "VERSION"
+
+    # METADATA at top
+    metadata_keywords = [
+        "CAMPAIGN SOURCE", "CAMPAIGN NAME", "SOURCE CODE",
+        "CAMPAIGN CODE", "PROJECT", "PREPARED BY", "APPROVED BY"
+    ]
+    if relative_y < 0.10:
+        return "METADATA"
+    if any(k in text_upper for k in metadata_keywords):
+        return "METADATA"
+
+    # NOTES - outside flow content
+    notes_keywords = [
+        "LEGEND", "NOTE:", "NOTES:", "REFERENCE", "VERSION HISTORY",
+        "CHANGE LOG", "DEFINITION", "ABBREVIATION", "RESPONSIBILITY",
+        "AUTHOR", "REVISION", "VERSION NUMBER", "DATE:"
+    ]
+    if any(k in text_upper for k in notes_keywords):
+        return "NOTES"
+
+    if relative_y > 0.85:
+        return "NOTES"
+
+    # DECISION - diamond shapes
+    decision_keywords = [
+        "?", "CHECK", "SUPPRESSION", "SUPPRESS", "VALID", "ELIGIBLE",
+        "ACTIVE", "FLAG", "FILTER", "MATCH", "EMAIL", "STATE", "GLOBAL",
+        "CHANNEL", "OPT", "INCLUDE", "EXCLUDE", "OPENED", "CLICKED",
+        "CONTACT", "RESEND", "FREQUENCY", "CAP", "LIMIT", "HCP"
+    ]
+    word_count = len(text.split())
+
+    if "?" in text:
+        return "DECISION"
+    if word_count >= 3 and any(k in text_upper for k in decision_keywords):
+        return "DECISION"
+
+    # PROCESS - action steps
+    process_keywords = [
+        "SEND", "OUTPUT", "GENERATE", "CREATE", "UPDATE", "LOAD",
+        "EXECUTE", "RUN", "PROCESS", "APPLY", "ADD", "REMOVE",
+        "RESEND", "TRIGGER", "SCHEDULE", "INITIATE"
+    ]
+    if any(k in text_upper for k in process_keywords):
+        return "PROCESS"
+
+    if word_count >= 4:
+        return "PROCESS"
+
+    return "NOTES"
+
+
+# ============================================================
+# STEP 4 - BUILD ORDERED FLOW SEQUENCE
+# ============================================================
+
+def build_flow_sequence(blocks):
+    """
+    Extract ordered list of decisions, processes, and metadata.
+    """
+    flow = {
+        "metadata":   [],
+        "decisions":  [],
+        "processes":  [],
+        "end_states": [],
+        "connectors": [],
+        "notes":      []
+    }
+
+    for block in blocks:
+        shape_type = block.get("shape_type", "NOTES")
+        text       = block["text"].strip()
+
+        if shape_type == "METADATA":
+            flow["metadata"].append(text)
+        elif shape_type == "DECISION":
+            flow["decisions"].append({
+                "condition":  text,
+                "y_position": block["y0"],
+                "x_position": block.get("center_x", 0),
+                "yes_action": "continue",
+                "no_action":  "exclude"
+            })
+        elif shape_type == "PROCESS":
+            flow["processes"].append({
+                "action":     text,
+                "y_position": block["y0"]
+            })
+        elif shape_type == "END":
+            flow["end_states"].append(text)
+        elif shape_type == "CONNECTOR":
+            flow["connectors"].append({
+                "label":      text,
+                "y_position": block["y0"],
+                "x_position": block.get("center_x", 0)
+            })
+        else:
+            flow["notes"].append(text)
+
+    flow["decisions"].sort(key=lambda d: d["y_position"])
+
+    for i, decision in enumerate(flow["decisions"]):
+        decision["step_number"] = i + 1
+
+    # Associate YES/NO connectors with nearest decision
+    for connector in flow["connectors"]:
+        label  = connector["label"].upper()
+        conn_y = connector["y_position"]
+        conn_x = connector["x_position"]
+
+        decisions_above = [
+            d for d in flow["decisions"]
+            if d["y_position"] <= conn_y
+        ]
+
+        if decisions_above:
+            closest = max(decisions_above, key=lambda d: d["y_position"])
+
+            if label == "YES":
+                if conn_x > closest["x_position"] + 50:
+                    closest["yes_action"] = "exclude_right_branch"
+                else:
+                    closest["yes_action"] = "continue_down"
+            elif label == "NO":
+                if conn_x > closest["x_position"] + 50:
+                    closest["no_action"] = "exclude_right_branch"
+                else:
+                    closest["no_action"] = "continue_down"
+
+    return flow
+
+
+# ============================================================
+# STEP 5 - GENERATE SQL SUGGESTIONS
+# ============================================================
+
+def generate_sql(condition_text, confidence_setting="HIGH"):
+    """
+    Convert a business rule condition into a SQL WHERE clause.
+    Returns (sql, confidence, column_hints, notes)
+    """
+    text_upper = condition_text.upper()
+
+    # Email / contact validity
+    if any(k in text_upper for k in ["EMAIL", "VALID EMAIL", "EMAIL CHECK",
+                                      "BEST CONTACT", "CONTACT EMAIL"]):
+        return (
+            "EMAIL IS NOT NULL AND TRIM(EMAIL) != ''",
+            "HIGH",
+            ["EMAIL", "BEST_CONTACT_EMAIL", "CONTACT_EMAIL"],
+            "Filter to records with valid email address"
+        )
+
+    # State suppression
+    if "STATE" in text_upper and any(k in text_upper for k in
+                                      ["SUPPRESS", "SUPPRESSION", "HCP", "IN"]):
+        states = re.findall(
+            r'\b(Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|'
+            r'Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|'
+            r'Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|'
+            r'Mississippi|Missouri|Montana|Nebraska|Nevada|New Hampshire|New Jersey|'
+            r'New Mexico|New York|North Carolina|North Dakota|Ohio|Oklahoma|Oregon|'
+            r'Pennsylvania|Rhode Island|South Carolina|South Dakota|Tennessee|Texas|'
+            r'Utah|Vermont|Virginia|Washington|West Virginia|Wisconsin|Wyoming)\b',
+            condition_text, re.IGNORECASE
+        )
+        if states:
+            state_list = ", ".join([f"'{s}'" for s in states])
+            return (
+                f"STATE NOT IN ({state_list})",
+                "HIGH",
+                ["STATE", "HCP_STATE", "TERRITORY_STATE"],
+                f"Suppress HCPs in: {', '.join(states)}"
+            )
+        return (
+            "STATE NOT IN (<state_list>)",
+            "MEDIUM",
+            ["STATE", "HCP_STATE"],
+            "State suppression - extract specific states from Visio"
+        )
+
+    # Global suppression
+    if "GLOBAL" in text_upper and "SUPPRESS" in text_upper:
+        channel = ""
+        if "EM" in text_upper or "EMAIL" in text_upper:
+            channel = "EMAIL"
+        if "PH" in text_upper or "PHONE" in text_upper:
+            channel += "_PHONE" if channel else "PHONE"
+        if "DM" in text_upper or "DIRECT" in text_upper:
+            channel += "_DM" if channel else "DM"
+
+        col = f"GLOBAL_SUPPRESSION_{channel}_FLAG" if channel else "GLOBAL_SUPPRESSION_FLAG"
+        return (
+            f"{col} != 'Y'",
+            "MEDIUM",
+            [col, "GLOBAL_SUPPRESSION_FLAG", "SUPPRESSION_FLAG"],
+            f"Global suppression for channel: {channel or 'ALL'}"
+        )
+
+    # Channel suppression
+    channel_match = re.search(
+        r'(?:CHANNEL|BY CHANNEL)\s*[:\(]?\s*([A-Z/,\s]+)',
+        condition_text, re.IGNORECASE
+    )
+    if channel_match:
+        channels = re.findall(r'[A-Z]{2,}', channel_match.group(1))
+        if channels:
+            channel_conditions = " OR ".join([f"CHANNEL = '{c}'" for c in channels])
+            return (
+                f"NOT ({channel_conditions})",
+                "MEDIUM",
+                ["CHANNEL", "CHANNEL_TYPE", "COMM_CHANNEL"],
+                f"Suppress by channel: {', '.join(channels)}"
+            )
+
+    # Opt-out
+    if any(k in text_upper for k in ["OPT OUT", "OPT-OUT", "OPTED OUT", "UNSUBSCRIBE"]):
+        return (
+            "OPT_OUT_FLAG != 'Y'",
+            "MEDIUM",
+            ["OPT_OUT_FLAG", "UNSUBSCRIBE_FLAG", "DO_NOT_CONTACT"],
+            "Exclude opted-out records"
+        )
+
+    # Opt-in
+    if any(k in text_upper for k in ["OPT IN", "OPT-IN", "OPTED IN", "SUBSCRIBED"]):
+        return (
+            "OPT_IN_FLAG = 'Y'",
+            "MEDIUM",
+            ["OPT_IN_FLAG", "CONSENT_FLAG"],
+            "Include only opted-in records"
+        )
+
+    # Frequency / send cap
+    if any(k in text_upper for k in ["FREQUENCY", "CAP", "SEND CAP", "LIMIT"]):
+        return (
+            "SEND_COUNT < SEND_CAP_LIMIT",
+            "LOW",
+            ["SEND_COUNT", "FREQUENCY_COUNT", "CONTACT_COUNT"],
+            "Frequency capping rule - verify column names in dataset"
+        )
+
+    # Email engagement
+    if any(k in text_upper for k in ["OPENED", "CLICKED", "ENGAGED", "RESPONDED"]):
+        return (
+            "EMAIL_OPEN_FLAG = 'Y' OR EMAIL_CLICK_FLAG = 'Y'",
+            "LOW",
+            ["EMAIL_OPEN_FLAG", "EMAIL_CLICK_FLAG", "ENGAGEMENT_FLAG"],
+            "Email engagement check - verify column names in dataset"
+        )
+
+    # Active / eligible
+    if any(k in text_upper for k in ["ACTIVE", "ELIGIBLE", "QUALIFIED"]):
+        return (
+            "STATUS = 'ACTIVE'",
+            "LOW",
+            ["STATUS", "ACTIVE_FLAG", "ELIGIBLE_FLAG"],
+            "Status/eligibility check - verify column names in dataset"
+        )
+
+    return (
+        None,
+        "LOW",
+        [],
+        "Manual SQL translation required - business rule needs analyst interpretation"
+    )
+
+
+# ============================================================
+# STEP 6 - BUILD COMBINED WHERE CLAUSE
+# ============================================================
+
+def build_combined_sql(decisions):
+    """Combine all HIGH and MEDIUM confidence SQL conditions."""
+    conditions = []
+    for d in decisions:
+        sql  = d.get("sql_suggestion")
+        conf = d.get("sql_confidence", "LOW")
+        if sql and conf in ("HIGH", "MEDIUM"):
+            conditions.append(
+                f"    -- Step {d['step_number']}: {d['condition']}\n"
+                f"    {sql}"
+            )
+    if not conditions:
+        return None
+    return "SELECT *\nFROM <source_dataset>\nWHERE\n" + "\n    AND ".join(conditions)
+
+
+# ============================================================
+# STEP 7 - BUILD MARKDOWN REPORT
+# ============================================================
+
+def build_markdown(data):
+    lines = []
+    lines.append("# ARIS Design Context - Business Flow")
+    lines.append(f"\n**Project:** {data['project']}")
+    lines.append(f"**Flow:** {data['flow_name']}")
+    lines.append(f"**Source PDF:** {data['source_file']}")
+    lines.append(f"**Generated:** {data['generated_at']}")
+
+    # Version history
+    version_info = data.get("version_history", {})
+    versions = version_info.get("versions", [])
+    if versions:
+        lines.append("\n---\n## Version History\n")
+        lines.append("| Version | Date | Description | Author |")
+        lines.append("|---|---|---|---|")
+        for v in versions:
+            lines.append(
+                f"| {v['version']} | {v['date']} | {v['description']} | {v['author']} |"
+            )
+
+    # Responsibility / legend
+    responsibility = version_info.get("responsibility", [])
+    if responsibility:
+        lines.append("\n**Responsibility:**")
+        for r in responsibility:
+            lines.append(f"- {r}")
+
+    # Campaign metadata
+    if data["campaign_metadata"]:
+        lines.append("\n---\n## Campaign / Source Information\n")
+        for item in data["campaign_metadata"]:
+            lines.append(f"- {item}")
+
+    # Flow summary
+    summary = data["flow_summary"]
+    lines.append("\n---\n## Flow Summary\n")
+    lines.append("| Metric | Value |")
+    lines.append("|---|---|")
+    lines.append(f"| Total filter rules | {summary['total_decisions']} |")
+    lines.append(f"| Process steps | {summary['total_processes']} |")
+    lines.append(f"| High confidence SQL | {summary['high_confidence']} |")
+    lines.append(f"| Medium confidence SQL | {summary['medium_confidence']} |")
+    lines.append(f"| Manual review needed | {summary['manual_review']} |")
+
+    # Business rules
+    lines.append("\n---\n## Business Rules (Filter Conditions)\n")
+    lines.append("> Rules applied top to bottom.")
+    lines.append("> Records failing a rule are excluded via YES or NO branch.\n")
+
+    for decision in data["decision_nodes"]:
+        step       = decision["step_number"]
+        condition  = decision["condition"]
+        sql        = decision.get("sql_suggestion")
+        conf       = decision.get("sql_confidence", "LOW")
+        notes      = decision.get("sql_notes", "")
+        hints      = decision.get("column_hints", [])
+        yes_action = decision.get("yes_action", "")
+        no_action  = decision.get("no_action", "")
+
+        conf_label = "[HIGH]" if conf == "HIGH" else "[MEDIUM]" if conf == "MEDIUM" else "[LOW - MANUAL]"
+
+        lines.append(f"### Step {step}: {condition}\n")
+        lines.append(f"| Field | Value |")
+        lines.append(f"|---|---|")
+        lines.append(f"| YES path | {yes_action} |")
+        lines.append(f"| NO path | {no_action} |")
+        lines.append(f"| SQL confidence | {conf_label} |")
+
+        if hints:
+            lines.append(f"| Column hints | `{'`, `'.join(hints)}` |")
+
+        if sql:
+            lines.append(f"\n**Suggested SQL:**\n```sql\n{sql}\n```")
+        else:
+            lines.append(f"\n**SQL:** Manual translation required.")
+
+        lines.append(f"\n> {notes}\n")
+
+    # Process steps
+    if data["process_steps"]:
+        lines.append("\n---\n## Process Steps\n")
+        for i, step in enumerate(data["process_steps"], 1):
+            lines.append(f"{i}. {step['action']}")
+
+    # Combined SQL
+    if data["generated_sql"]["combined_where_clause"]:
+        lines.append("\n---\n## Generated WHERE Clause\n")
+        lines.append("> Combines all HIGH and MEDIUM confidence rules.")
+        lines.append("> Review all conditions before using in production.\n")
+        lines.append(f"```sql\n{data['generated_sql']['combined_where_clause']}\n```")
+
+    # Column hints for Phase 2
+    lines.append("\n---\n## Column Hints for ARIS Phase 2\n")
+    lines.append("Use these as SEARCH_TERMS in config/aris_config.py before running Phase 2:\n")
+    for hint in data.get("column_hints", []):
+        lines.append(f"- `{hint}`")
+
+    lines.append("\n---\n## Next Steps\n")
+    lines.append("1. Review business rules above for accuracy")
+    lines.append("2. Update SEARCH_TERMS in config/aris_config.py with column hints")
+    lines.append("3. Run Phase 2: python phase2_impact/impact.py")
+    lines.append("4. Compare these rules against actual recipe SQL in RECIPE_INTELLIGENCE.json")
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def run_visio_converter():
+
+    print("=" * 80)
+    print("ARIS v1.0 | Visio PDF Converter")
+    print("=" * 80)
+    print(f"Project      : {PROJECT_KEY}")
+    print(f"PDF File     : {PDF_FILENAME}")
+    print(f"Flow Name    : {FLOW_NAME}")
+    print(f"Started      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 80)
+
+    os.makedirs(LOCAL_OUTPUT_DIR, exist_ok=True)
+    os.makedirs(LOCAL_PDF_DIR, exist_ok=True)
+
+    pdf_file = pdf_path(PDF_FILENAME)
+    if not os.path.exists(pdf_file):
+        print(f"\n[ERROR] PDF not found: {pdf_file}")
+        print(f"   Place your PDF in the pdfs\\ folder")
+        print(f"   Update PDF_FILENAME in config\\aris_config.py")
+        return
+
+    # ----------------------------------------------------------
+    # EXTRACT TEXT BLOCKS
+    # ----------------------------------------------------------
+    print(f"\nReading PDF: {pdf_file}")
+    blocks = extract_text_blocks(pdf_file)
+    print(f"[OK] Extracted {len(blocks)} text blocks")
+
+    # ----------------------------------------------------------
+    # EXTRACT VERSION HISTORY
+    # ----------------------------------------------------------
+    print("\nExtracting version history...")
+    version_history = extract_version_history(blocks)
+    print(f"[OK] Version entries found: {len(version_history['versions'])}")
+    if version_history["versions"]:
+        for v in version_history["versions"]:
+            print(f"     v{v['version']} | {v['date']} | {v['description'][:50]}")
+
+    # ----------------------------------------------------------
+    # CLASSIFY BLOCKS
+    # ----------------------------------------------------------
+    for block in blocks:
+        block["shape_type"] = classify_block(block, blocks)
+
+    type_counts = {}
+    for block in blocks:
+        t = block["shape_type"]
+        type_counts[t] = type_counts.get(t, 0) + 1
+
+    print(f"\nShape classification:")
+    for shape_type, count in type_counts.items():
+        print(f"  {shape_type:<15} : {count}")
+
+    # ----------------------------------------------------------
+    # BUILD FLOW SEQUENCE
+    # ----------------------------------------------------------
+    flow      = build_flow_sequence(blocks)
+    decisions = flow["decisions"]
+
+    print(f"\nFlow structure:")
+    print(f"  Metadata items : {len(flow['metadata'])}")
+    print(f"  Decision nodes : {len(decisions)}")
+    print(f"  Process steps  : {len(flow['processes'])}")
+    print(f"  End states     : {len(flow['end_states'])}")
+
+    # ----------------------------------------------------------
+    # GENERATE SQL SUGGESTIONS
+    # ----------------------------------------------------------
+    print(f"\nGenerating SQL suggestions...")
+
+    all_column_hints = []
+
+    for decision in decisions:
+        sql, conf, hints, notes = generate_sql(
+            decision["condition"],
+            SQL_CONFIDENCE
+        )
+        decision["sql_suggestion"] = sql
+        decision["sql_confidence"] = conf
+        decision["column_hints"]   = hints
+        decision["sql_notes"]      = notes
+        all_column_hints.extend(hints)
+
+        conf_label = "[HIGH]" if conf == "HIGH" else "[MEDIUM]" if conf == "MEDIUM" else "[LOW]"
+        print(f"  {conf_label} Step {decision['step_number']}: {decision['condition'][:55]}")
+        if sql:
+            print(f"     SQL: {sql[:70]}")
+
+    combined_sql  = build_combined_sql(decisions)
+    unique_hints  = list(dict.fromkeys(all_column_hints))
+
+    # ----------------------------------------------------------
+    # BUILD JSON OUTPUT
+    # ----------------------------------------------------------
+    ARIS_METADATA = {
+        "aris_version":    "1.0",
+        "phase":           "Visio PDF Converter",
+        "project":         PROJECT_KEY,
+        "generated_at":    datetime.now().isoformat(timespec="seconds"),
+        "source_file":     PDF_FILENAME,
+        "flow_name":       FLOW_NAME
+    }
+
+    design_context = {
+        **ARIS_METADATA,
+        "version_history":   version_history,
+        "campaign_metadata": flow["metadata"],
+        "flow_summary": {
+            "total_decisions":   len(decisions),
+            "total_processes":   len(flow["processes"]),
+            "high_confidence":   sum(1 for d in decisions if d.get("sql_confidence") == "HIGH"),
+            "medium_confidence": sum(1 for d in decisions if d.get("sql_confidence") == "MEDIUM"),
+            "manual_review":     sum(1 for d in decisions if d.get("sql_confidence") == "LOW")
+        },
+        "decision_nodes":  decisions,
+        "process_steps":   flow["processes"],
+        "end_states":      flow["end_states"],
+        "column_hints":    unique_hints,
+        "generated_sql": {
+            "combined_where_clause": combined_sql,
+            "note": (
+                "Review MEDIUM confidence conditions before using in production. "
+                "Verify column names against ARIS_DATASET_REGISTRY.json"
+            )
+        }
+    }
+
+    # ----------------------------------------------------------
+    # BUILD MARKDOWN
+    # ----------------------------------------------------------
+    markdown = build_markdown(design_context)
+
+    # ----------------------------------------------------------
+    # SAVE OUTPUTS
+    # ----------------------------------------------------------
+    def save_json(filename, data):
+        path = output_path(filename)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+        print(f"  [SAVED] {filename}")
+
+    def save_text(filename, text):
+        path = output_path(filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"  [SAVED] {filename}")
+
+    print("\nSaving outputs...")
+    save_json(DESIGN_CONTEXT_FILE, design_context)
+    save_text(DESIGN_CONTEXT_MD,   markdown)
+
+    # ----------------------------------------------------------
+    # FINAL STATUS
+    # ----------------------------------------------------------
+    print("\n")
+    print("=" * 80)
+    print("ARIS Visio PDF Converter Complete")
+    print("=" * 80)
+    print(f"Project          : {PROJECT_KEY}")
+    print(f"Completed        : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Decision nodes   : {len(decisions)}")
+    print(f"Version history  : {len(version_history['versions'])} entries")
+    print()
+
+    for d in decisions:
+        conf = d.get("sql_confidence", "LOW")
+        label = "[HIGH]" if conf == "HIGH" else "[MEDIUM]" if conf == "MEDIUM" else "[LOW]"
+        print(f"  {label} Step {d['step_number']}: {d['condition'][:60]}")
+        if d.get("sql_suggestion"):
+            print(f"       -> {d['sql_suggestion'][:65]}")
+
+    print()
+    if combined_sql:
+        print("[OK] Combined WHERE clause generated")
+    else:
+        print("[WARNING] Combined WHERE clause needs manual review")
+
+    print()
+    print("Column hints for SEARCH_TERMS in Phase 2:")
+    for hint in unique_hints[:10]:
+        print(f"  -> {hint}")
+
+    print()
+    print(f"Output files in: {LOCAL_OUTPUT_DIR}\\")
+    print(f"  [SAVED] {DESIGN_CONTEXT_FILE}")
+    print(f"  [SAVED] {DESIGN_CONTEXT_MD}")
+    print()
+    print("Next steps:")
+    print("  1. Review outputs\\" + DESIGN_CONTEXT_MD + " for accuracy")
+    print("  2. Update SEARCH_TERMS in config\\aris_config.py with column hints above")
+    print("  3. Run: python phase2_impact\\impact.py")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    run_visio_converter()
