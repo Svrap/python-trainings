@@ -1,0 +1,47 @@
+mkdir ARIS
+cd ARIS
+mkdir src
+mkdir outputs
+mkdir pdfs
+mkdir logs
+type nul > .env.example
+type nul > .env
+type nul > .gitignore
+type nul > README.md
+type nul > requirements.txt
+type nul > run_aris.py
+type nul > src\__init__.py
+type nul > src\config.py
+type nul > src\scanner.py
+type nul > src\transformation.py
+type nul > src\visio_extractor.py
+
+cd ARIS
+python -m venv venv
+venv\Scripts\activate
+
+
+# ARIS - Automated Recipe Intelligence System
+# Requirements file
+# Install with: pip install -r requirements.txt
+
+# Dataiku official Python client
+dataikuapi
+
+# PDF extraction - primary
+pymupdf
+
+# PDF extraction - fallback
+pdfplumber
+
+# Visio .vsdx file parsing (install when .vsdx file available)
+# vsdx
+
+# Environment variable management
+python-dotenv
+
+# HTTP requests (used for fallback API calls)
+requests
+
+# SSL warning suppression
+urllib3
