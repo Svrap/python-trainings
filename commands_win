@@ -70,3 +70,35 @@ urllib3
 # Visio .vsdx file parsing
 # Uncomment when .vsdx file is available
 # vsdx
+
+//////
+
+# ARIS Configuration Template
+# Copy this file to .env and fill in your values
+# Never commit .env to Git
+
+# -------------------------------------------------------
+# REQUIRED - Dataiku connection
+# -------------------------------------------------------
+DATAIKU_URL=https://your-dataiku-instance.com
+DATAIKU_API_KEY=your-api-key-here
+PROJECT_KEY=YOUR_PROJECT_KEY
+
+# -------------------------------------------------------
+# OPTIONAL - Visio file
+# Place your file in the pdfs/ folder
+# Leave blank if no Visio file
+# -------------------------------------------------------
+VISIO_FILE=
+
+# -------------------------------------------------------
+# OPTIONAL - Folder locations (defaults shown)
+# -------------------------------------------------------
+LOCAL_OUTPUT_DIR=outputs
+LOCAL_PDF_DIR=pdfs
+LOG_DIR=logs
+
+# -------------------------------------------------------
+# OPTIONAL - Settings (defaults shown)
+# -------------------------------------------------------
+STALE_AFTER_DAYS=7
