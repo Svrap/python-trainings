@@ -1,0 +1,111 @@
+# ============================================================
+# ARIS - run_aris.py
+# Single entry point for all ARIS phases.
+#
+# SETUP:
+#   1. pip install -r requirements.txt
+#   2. Copy .env.example to .env and fill in your values
+#   3. Place your Visio file in pdfs\ folder
+#
+# USAGE:
+#   python run_aris.py --scan        Run Phase 1 (project scanner)
+#   python run_aris.py --analyse     Run Phase 3 (code intelligence)
+#   python run_aris.py --visio       Run Visio extractor
+#   python run_aris.py --all         Run all phases in sequence
+# ============================================================
+
+import argparse
+import sys
+import os
+import logging
+
+# Add project root to path
+sys.path.insert(0, os.path.dirname(__file__))
+
+from src.config import validate, log, VISIO_FILE
+
+
+def run_scan():
+    from src.scanner import run_phase1
+    log.info("Starting Phase 1 - Project Scanner")
+    run_phase1()
+
+
+def run_analyse():
+    from src.transformation import run_phase3
+    log.info("Starting Phase 3 - Code Intelligence")
+    run_phase3()
+
+
+def run_visio():
+    if not VISIO_FILE:
+        log.error("VISIO_FILE not set in .env. Add the filename and place it in pdfs/")
+        return
+    from src.visio_extractor import run_visio_extractor
+    log.info("Starting Visio Extractor")
+    run_visio_extractor()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ARIS - Automated Recipe Intelligence System",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        "--scan",
+        action="store_true",
+        help="Run Phase 1: scan Dataiku project and build knowledge base"
+    )
+    parser.add_argument(
+        "--analyse",
+        action="store_true",
+        help="Run Phase 3: code intelligence on all recipes"
+    )
+    parser.add_argument(
+        "--visio",
+        action="store_true",
+        help="Run Visio extractor: extract business rules from PDF or VSDX"
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run all phases in sequence: scan -> analyse -> visio (if file set)"
+    )
+
+    args = parser.parse_args()
+
+    # Show help if no arguments given
+    if not any(vars(args).values()):
+        parser.print_help()
+        print("\nExample: python run_aris.py --all")
+        return
+
+    # Validate config before running anything
+    try:
+        validate()
+    except EnvironmentError as e:
+        log.error(str(e))
+        sys.exit(1)
+
+    # Run requested phases
+    if args.all:
+        run_scan()
+        run_analyse()
+        if VISIO_FILE:
+            run_visio()
+        else:
+            log.info("VISIO_FILE not set in .env - skipping Visio extraction")
+        return
+
+    if args.scan:
+        run_scan()
+
+    if args.analyse:
+        run_analyse()
+
+    if args.visio:
+        run_visio()
+
+
+if __name__ == "__main__":
+    main()
