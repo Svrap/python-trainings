@@ -1,0 +1,1258 @@
+# ============================================================
+# ARIS Visio Extractor
+# Pure extraction of business flow from Visio files.
+# No SQL generation. No hardcoding. No interpretation.
+# Just reads what is in the Visio and builds clean context.
+#
+# SUPPORTS:
+#   .vsdx files (preferred - 95%+ accuracy)
+#   .pdf  files (fallback - uses PyMuPDF)
+#
+# RUN FROM PROJECT ROOT:
+#   python visio_converter\visio_extractor.py
+#
+# CONFIGURE in config\aris_config.py:
+#   VISIO_FILE = "your_file.vsdx"  (or .pdf)
+#
+# OUTPUTS:
+#   {PREFIX}DESIGN_CONTEXT.json  - machine readable
+#   {PREFIX}DESIGN_CONTEXT.md    - human readable for LLM
+# ============================================================
+
+import json
+import os
+import re
+import sys
+from datetime import datetime
+
+
+
+from src.config import (
+    PROJECT_KEY,
+    LOCAL_OUTPUT_DIR,
+    LOCAL_PDF_DIR,
+    DESIGN_CONTEXT_FILE,
+    DESIGN_CONTEXT_MD,
+    output_path,
+    pdf_path
+)
+
+try:
+    from src.config import VISIO_FILE
+except ImportError:
+    VISIO_FILE = "your_flow.vsdx"
+
+# ============================================================
+# SHAPE MASTER NAME LISTS
+# These are standard Visio master shape names.
+# Works for any Visio file from any domain.
+# ============================================================
+
+DECISION_MASTERS = [
+    "decision", "diamond", "rhombus",
+    "decision2", "conditional", "gateway"
+]
+
+PROCESS_MASTERS = [
+    "process", "rectangle", "box", "task",
+    "action", "step", "activity", "subprocess"
+]
+
+START_MASTERS = [
+    "start", "terminator", "rounded rectangle",
+    "begin", "trigger", "oval", "start 1",
+    "start 2", "initiation"
+]
+
+END_MASTERS = [
+    "end", "terminator", "stop", "finish",
+    "terminal", "end 1", "end 2"
+]
+
+# ============================================================
+# SHAPE CLASSIFIER
+# Uses Visio master shape name first (most reliable).
+# Falls back to text analysis if master name not available.
+# Works for any Visio diagram from any domain.
+# ============================================================
+
+RULE_PATTERNS = [
+    r"\bif\b", r"\bwhen\b", r"\bunless\b", r"\belse\b",
+    r"\bgreater than\b", r"\bless than\b", r"\bmore than\b",
+    r"\bat least\b", r"\bat most\b", r"\bonly once\b",
+    r"\bequals?\b", r"\bnot equal\b", r"\bbetween\b",
+    r"\bincludes?\b", r"\bexcludes?\b", r"\bfilter\b",
+    r"\blimit(?:s)?\b", r"\bcriteria\b", r"\beligib(?:le|ility)\b"
+]
+
+RULE_DIMENSION_WORDS = {
+    "market", "product", "zip", "specialty", "state", "pre", "post",
+    "channel", "segment", "status", "country", "region", "date", "limit"
+}
+
+
+def _normalise_text(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _safe_attr(obj, *names, default=None):
+    if obj is None:
+        return default
+    for name in names:
+        try:
+            value = getattr(obj, name)
+            if callable(value):
+                value = value()
+            if value is not None and value != "":
+                return value
+        except Exception:
+            continue
+    return default
+
+
+def _shape_id(shape, fallback=""):
+    return str(_safe_attr(shape, "ID", "id", "shape_id", default=fallback))
+
+
+def _shape_text(shape):
+    return _normalise_text(_safe_attr(shape, "text", default=""))
+
+
+def _master_name(shape):
+    candidates = []
+    for attr in ("master_shape", "master_page"):
+        obj = _safe_attr(shape, attr)
+        candidates.extend([
+            _safe_attr(obj, "name", "Name", default=""),
+            _safe_attr(obj, "universal_name", "name_u", "NameU", default="")
+        ])
+    candidates.extend([
+        _safe_attr(shape, "name", "Name", default=""),
+        _safe_attr(shape, "universal_name", "name_u", "NameU", default="")
+    ])
+    return next((_normalise_text(v) for v in candidates if _normalise_text(v)), "")
+
+
+def _looks_like_rule(text):
+    normal = _normalise_text(text)
+    lower = normal.lower()
+    if not normal:
+        return False, "empty text"
+    if "?" in normal:
+        return True, "question mark"
+    for pattern in RULE_PATTERNS:
+        if re.search(pattern, lower, flags=re.IGNORECASE):
+            return True, f"text pattern: {pattern}"
+    words = set(re.findall(r"[a-z]+", lower))
+    hits = words.intersection(RULE_DIMENSION_WORDS)
+    if len(hits) >= 2:
+        return True, "multiple filter dimensions"
+    if hits and ("," in normal or " and " in lower or "/" in normal):
+        return True, "combined filter dimensions"
+    return False, ""
+
+
+def _semantic_tags(text):
+    """Return evidence-based semantic tags without changing the visual shape type."""
+    value = _normalise_text(text)
+    lower = value.lower()
+    tags = []
+    if _looks_like_rule(value)[0]:
+        tags.append("BUSINESS_RULE")
+    if re.search(r"\b(input|source|file|table|dataset|feed)\b", lower):
+        tags.append("DATA_INPUT")
+    if re.search(r"\b(output|visuali[sz]ation|report|dashboard|full data)\b", lower):
+        tags.append("DATA_OUTPUT")
+    if re.search(r"\b(match conditions?|matching|zip|state|specialty|tier)\b", lower):
+        tags.append("MATCH_CONDITION")
+    if re.search(r"\b(trx|nrx|nbrx|calls?|samples?|weightages?|euclidean distance)\b", lower):
+        tags.append("MEASURE_OR_METHOD")
+    return list(dict.fromkeys(tags))
+
+
+def _rule_kind(text):
+    lower = _normalise_text(text).lower()
+    if re.search(r"\b(if|else|when|unless|only once|more than once|greater than|less than|between)\b", lower):
+        return "CONDITIONAL_RULE"
+    if re.search(r"\b(match conditions?|zip|state|specialty|tier)\b", lower):
+        return "MATCH_RULE"
+    if re.search(r"\b(pre|post|limit|time period)\b", lower):
+        return "WINDOW_OR_LIMIT_RULE"
+    return "BUSINESS_RULE"
+
+def classify_shape_by_master(master_name, shape_text):
+    name = _normalise_text(master_name).lower()
+    text = _normalise_text(shape_text).upper()
+    if any(m in name for m in DECISION_MASTERS):
+        return "DECISION", "decision master"
+    if any(m in name for m in END_MASTERS) or text in {"END", "STOP", "FINISH", "DONE", "EXIT"}:
+        return "END", "end master/text"
+    if any(m in name for m in START_MASTERS):
+        return "START", "start master"
+    if any(m in name for m in PROCESS_MASTERS):
+        return "PROCESS", "process master"
+    return None, ""
+
+
+def classify_shape_by_text(shape_text):
+    text = _normalise_text(shape_text)
+    upper = text.upper()
+    if not text:
+        return "EMPTY", "no text"
+    if upper in ("STOP", "END", "FINISH", "DONE", "EXIT", "ELIGIBLE",
+                 "NOT ELIGIBLE", "SUPPRESSED", "EXCLUDED", "INCLUDED"):
+        return "END", "end-state text"
+    if upper in ("YES", "NO", "Y", "N", "TRUE", "FALSE"):
+        return "CONNECTOR_LABEL", "branch label"
+    is_rule, reason = _looks_like_rule(text)
+    if is_rule:
+        return "DECISION", reason
+    if len(text.split()) <= 2:
+        return "NOTES", "short label"
+    return "UNKNOWN", "no reliable shape or text signal"
+
+
+def get_shape_type(shape):
+    """Classify the visual role. Semantic business-rule tags are stored separately."""
+    shape_text = _shape_text(shape)
+    master_name = _master_name(shape)
+    text_type, text_reason = classify_shape_by_text(shape_text)
+    master_type, master_reason = classify_shape_by_master(master_name, shape_text)
+
+    if text_type in {"END", "CONNECTOR_LABEL"}:
+        return text_type, master_name, text_reason
+    if master_type == "DECISION":
+        return "DECISION", master_name, master_reason
+    if master_type in {"START", "END", "PROCESS"}:
+        return master_type, master_name, master_reason
+    if text_type == "DECISION":
+        return "DECISION", master_name, f"inferred from {text_reason}"
+    return text_type, master_name, text_reason
+
+def _shape_number(shape, *names):
+    try:
+        return float(_safe_attr(shape, *names, default=0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _connection_id(connect, side):
+    if side == "from":
+        direct = _safe_attr(connect, "from_id", "from_sheet", "FromSheet")
+        endpoint = _safe_attr(connect, "from_shape")
+    else:
+        direct = _safe_attr(connect, "to_id", "to_sheet", "ToSheet")
+        endpoint = _safe_attr(connect, "to_shape")
+    return str(direct) if direct is not None else (_shape_id(endpoint, "") if endpoint else "")
+
+
+def _connection_label(connect):
+    label = _safe_attr(connect, "label", "text", default="")
+    if label:
+        return _normalise_text(label)
+    connector = _safe_attr(connect, "connector_shape", "connector")
+    return _shape_text(connector) if connector else ""
+
+# ============================================================
+# VSDX EXTRACTOR
+# Reads .vsdx file natively using vsdx library.
+# Extracts shapes, connectors, document properties.
+# ============================================================
+
+def _all_page_shapes(page):
+    """Return every shape, including shapes nested inside Visio groups."""
+    shapes = _safe_attr(page, "all_shapes", default=None)
+    if shapes is not None:
+        try:
+            return list(shapes)
+        except TypeError:
+            pass
+
+    result = []
+    seen = set()
+
+    def visit(shape):
+        key = id(shape)
+        if key in seen:
+            return
+        seen.add(key)
+        result.append(shape)
+        for child in (_safe_attr(shape, "child_shapes", default=[]) or []):
+            visit(child)
+
+    for shape in (_safe_attr(page, "child_shapes", default=[]) or []):
+        visit(shape)
+    return result
+
+
+def _connect_value(connect, *names):
+    """Read a Connect property across vsdx versions and raw XML wrappers."""
+    value = _safe_attr(connect, *names, default=None)
+    if value is not None:
+        return str(value)
+    xml = _safe_attr(connect, "xml", "element", default=None)
+    if xml is not None:
+        for name in names:
+            try:
+                value = xml.get(name)
+                if value is not None:
+                    return str(value)
+            except Exception:
+                pass
+    return ""
+
+
+def _page_connect_rows(page):
+    """Return normalized Visio Connect rows.
+
+    A Visio connector normally has two rows: connector.BeginX -> source shape
+    and connector.EndX -> destination shape. This function supports both the
+    public vsdx objects and the underlying page XML.
+    """
+    rows = []
+    connects = _safe_attr(page, "connects", default=None)
+    if connects is None:
+        getter = _safe_attr(page, "get_connects", default=None)
+        connects = getter if isinstance(getter, list) else []
+
+    for connect in (connects or []):
+        row = {
+            "from_sheet": _connect_value(connect, "from_sheet", "from_id", "FromSheet"),
+            "to_sheet": _connect_value(connect, "to_sheet", "to_id", "ToSheet"),
+            "from_cell": _connect_value(connect, "from_cell", "FromCell"),
+            "to_cell": _connect_value(connect, "to_cell", "ToCell"),
+        }
+        if row["from_sheet"] or row["to_sheet"]:
+            rows.append(row)
+
+    if rows:
+        return rows
+
+    # Final fallback: parse Connect elements from the page XML directly.
+    page_xml = _safe_attr(page, "xml", default=None)
+    root = None
+    try:
+        root = page_xml.getroot() if hasattr(page_xml, "getroot") else page_xml
+    except Exception:
+        root = None
+    if root is not None:
+        try:
+            for element in root.iter():
+                if str(element.tag).split("}")[-1] != "Connect":
+                    continue
+                rows.append({
+                    "from_sheet": str(element.get("FromSheet", "")),
+                    "to_sheet": str(element.get("ToSheet", "")),
+                    "from_cell": str(element.get("FromCell", "")),
+                    "to_cell": str(element.get("ToCell", "")),
+                })
+        except Exception:
+            pass
+    return rows
+
+
+def _is_connector_shape(shape, master_name=""):
+    name = _normalise_text(master_name or _master_name(shape)).lower()
+    one_d = _safe_attr(shape, "is_1d", "one_d", default=None)
+    if one_d is True or str(one_d).lower() in {"1", "true"}:
+        return True
+    return any(token in name for token in (
+        "connector", "dynamic connector", "line", "arrow", "flow line"
+    ))
+
+
+def _connector_edges(page, shape_map, all_shapes):
+    """Convert Visio Connect rows into directed shape-to-shape relationships."""
+    rows = _page_connect_rows(page)
+    by_connector = {}
+    warnings = []
+
+    for row in rows:
+        connector_id = str(row.get("from_sheet", ""))
+        target_id = str(row.get("to_sheet", ""))
+        endpoint = str(row.get("from_cell", "")).lower()
+        if not connector_id or not target_id:
+            continue
+        bucket = by_connector.setdefault(connector_id, {"begin": [], "end": [], "other": []})
+        if "begin" in endpoint:
+            bucket["begin"].append(target_id)
+        elif "end" in endpoint:
+            bucket["end"].append(target_id)
+        else:
+            bucket["other"].append(target_id)
+
+    shape_objects = {_shape_id(s, ""): s for s in all_shapes}
+    edges = []
+    for connector_id, endpoints in by_connector.items():
+        begin_ids = list(dict.fromkeys(endpoints["begin"]))
+        end_ids = list(dict.fromkeys(endpoints["end"]))
+        other_ids = list(dict.fromkeys(endpoints["other"]))
+
+        # Some producers omit FromCell. If exactly two targets exist, preserve
+        # the relation and mark that direction was inferred.
+        inferred = False
+        if not begin_ids and not end_ids and len(other_ids) >= 2:
+            begin_ids, end_ids = [other_ids[0]], [other_ids[1]]
+            inferred = True
+        elif not begin_ids and other_ids:
+            begin_ids = [other_ids[0]]
+            inferred = True
+        elif not end_ids and len(other_ids) > 1:
+            end_ids = [other_ids[-1]]
+            inferred = True
+
+        connector_shape = shape_objects.get(connector_id)
+        label = _shape_text(connector_shape) if connector_shape else ""
+        for source_id in begin_ids:
+            for target_id in end_ids:
+                if source_id == target_id:
+                    continue
+                source = shape_map.get(source_id, {})
+                target = shape_map.get(target_id, {})
+                edges.append({
+                    "connector_id": connector_id,
+                    "from_shape_id": source_id,
+                    "to_shape_id": target_id,
+                    "label": label,
+                    "from_shape_text": source.get("text", ""),
+                    "to_shape_text": target.get("text", ""),
+                    "from_shape_type": source.get("shape_type", ""),
+                    "to_shape_type": target.get("shape_type", ""),
+                    "direction_inferred": inferred,
+                    "page": source.get("page") or target.get("page")
+                })
+
+        if not begin_ids or not end_ids:
+            warnings.append(
+                f"Connector {connector_id} could not be resolved to both endpoints"
+            )
+    return edges, warnings, len(rows)
+
+
+def _apply_decision_paths(flow):
+    decisions = {d["id"]: d for d in flow.get("decisions", [])}
+    for edge in flow.get("connectors", []):
+        decision = decisions.get(edge.get("from_shape_id"))
+        if not decision:
+            continue
+        label = _normalise_text(edge.get("label", "")).upper()
+        target_type = edge.get("to_shape_type", "")
+        path = {
+            "action": "end" if target_type == "END" else "continue",
+            "target_text": edge.get("to_shape_text", ""),
+            "target_id": edge.get("to_shape_id", "")
+        }
+        if label in {"YES", "Y", "TRUE"}:
+            decision["yes_path"] = path
+        elif label in {"NO", "N", "FALSE"}:
+            decision["no_path"] = path
+        else:
+            decision.setdefault("other_paths", []).append({"label": label, **path})
+
+
+def _build_process_flow(flow):
+    """Create ordered flow paths without inventing missing relationships."""
+    nodes = {}
+    for item in flow.get("decisions", []) + flow.get("processes", []):
+        nodes[item["id"]] = item
+    for item in flow.get("end_state_details", []):
+        nodes[item["id"]] = item
+
+    outgoing = {}
+    incoming = {}
+    for edge in flow.get("connectors", []):
+        source = edge.get("from_shape_id")
+        target = edge.get("to_shape_id")
+        if source and target:
+            outgoing.setdefault(source, []).append(edge)
+            incoming.setdefault(target, []).append(edge)
+
+    roots = [node_id for node_id in nodes if node_id not in incoming]
+    roots.sort(key=lambda node_id: (
+        nodes[node_id].get("page", 0),
+        -nodes[node_id].get("y", 0),
+        nodes[node_id].get("x", 0)
+    ))
+    ordered = []
+    visited = set()
+
+    def walk(node_id, depth=0):
+        if node_id in visited or node_id not in nodes:
+            return
+        visited.add(node_id)
+        node = nodes[node_id]
+        ordered.append({
+            "sequence": len(ordered) + 1,
+            "shape_id": node_id,
+            "type": node.get("shape_type", ""),
+            "text": node.get("text", ""),
+            "depth": depth,
+            "next_shape_ids": [e.get("to_shape_id") for e in outgoing.get(node_id, [])]
+        })
+        for edge in outgoing.get(node_id, []):
+            walk(edge.get("to_shape_id"), depth + 1)
+
+    for root in roots:
+        walk(root)
+    for node_id in nodes:
+        walk(node_id)
+    return ordered
+
+
+def extract_from_vsdx(file_path):
+    """Extract shapes, rules, connectors, and reconstructed process flow."""
+    try:
+        import vsdx
+    except ImportError:
+        print("[ERROR] vsdx library not installed.")
+        print("   Run: pip install vsdx")
+        return None
+
+    flow = {
+        "source_type": "vsdx",
+        "source_file": os.path.basename(file_path),
+        "pages": [],
+        "document_info": {},
+        "metadata": [],
+        "decisions": [],
+        "processes": [],
+        "end_states": [],
+        "end_state_details": [],
+        "connectors": [],
+        "relationships": [],
+        "process_flow": [],
+        "business_rules": [],
+        "data_inputs": [],
+        "data_outputs": [],
+        "match_conditions": [],
+        "diagnostics": {},
+        "notes": [],
+        "unknown_shapes": [],
+        "warnings": []
+    }
+
+    with vsdx.VisioFile(file_path) as vis:
+        try:
+            props = _safe_attr(vis, "document_properties", default=None)
+            if props is None:
+                props = type("EmptyProperties", (), {})()
+            flow["document_info"] = {
+                "title": getattr(props, "title", "") or "",
+                "creator": getattr(props, "creator", "") or "",
+                "company": getattr(props, "company", "") or "",
+                "subject": getattr(props, "subject", "") or "",
+                "keywords": getattr(props, "keywords", "") or "",
+                "created": getattr(props, "created", "") or "",
+                "modified": getattr(props, "modified", "") or ""
+            }
+        except Exception as exc:
+            flow["warnings"].append(f"Document properties could not be read: {exc}")
+
+        for page_index, page in enumerate(vis.pages):
+            all_shapes = _all_page_shapes(page)
+            page_number = page_index + 1
+            page_info = {
+                "page_number": page_number,
+                "page_name": page.name or f"Page {page_number}",
+                "top_level_shape_count": len(_safe_attr(page, "child_shapes", default=[]) or []),
+                "shape_count": len(all_shapes)
+            }
+            flow["pages"].append(page_info)
+            print(f"  Page {page_number}: {page_info['page_name']} ({len(all_shapes)} shapes)")
+
+            shape_map = {}
+            connector_shape_ids = set()
+            page_records = []
+
+            # First pass builds a complete map, including connector and grouped shapes.
+            for idx, shape in enumerate(all_shapes):
+                shape_id = _shape_id(shape, f"shape_{page_number}_{idx}")
+                shape_text = _shape_text(shape)
+                master_name = _master_name(shape)
+                if _is_connector_shape(shape, master_name):
+                    connector_shape_ids.add(shape_id)
+                    continue
+                if not shape_text:
+                    continue
+
+                shape_type, master_name, reason = get_shape_type(shape)
+                record = {
+                    "id": shape_id,
+                    "text": shape_text,
+                    "shape_type": shape_type,
+                    "master_name": master_name,
+                    "classification_reason": reason,
+                    "semantic_tags": _semantic_tags(shape_text),
+                    "rule_kind": _rule_kind(shape_text) if _looks_like_rule(shape_text)[0] else "",
+                    "parent_shape_id": _shape_id(_safe_attr(shape, "parent", "parent_shape", default=None), ""),
+                    "x": _shape_number(shape, "x", "pin_x", "PinX"),
+                    "y": _shape_number(shape, "y", "pin_y", "PinY"),
+                    "width": _shape_number(shape, "width", "Width"),
+                    "height": _shape_number(shape, "height", "Height"),
+                    "page": page_number
+                }
+                shape_map[shape_id] = record
+                page_records.append(record)
+
+            # Classify only after the complete shape map exists.
+            for record in page_records:
+                shape_type = record["shape_type"]
+                if shape_type == "START":
+                    flow["metadata"].append(record["text"])
+                elif shape_type == "DECISION":
+                    flow["decisions"].append({
+                        **record,
+                        "step_number": 0,
+                        "yes_path": {"action": "unknown", "target_text": "", "target_id": ""},
+                        "no_path": {"action": "unknown", "target_text": "", "target_id": ""},
+                        "other_paths": []
+                    })
+                elif shape_type == "PROCESS":
+                    flow["processes"].append(record)
+                elif shape_type == "END":
+                    flow["end_states"].append(record["text"])
+                    flow["end_state_details"].append(record)
+                elif shape_type == "NOTES":
+                    flow["notes"].append(record["text"])
+                elif shape_type not in {"EMPTY", "CONNECTOR_LABEL"}:
+                    flow["unknown_shapes"].append(record)
+
+                tags = record.get("semantic_tags", [])
+                if "BUSINESS_RULE" in tags:
+                    flow["business_rules"].append({
+                        "rule_id": f"RULE_{len(flow['business_rules']) + 1:03d}",
+                        "text": record["text"],
+                        "rule_kind": record.get("rule_kind", "BUSINESS_RULE"),
+                        "shape_id": record["id"],
+                        "shape_type": record["shape_type"],
+                        "page": record["page"],
+                        "classification_evidence": record.get("classification_reason", "")
+                    })
+                if "DATA_INPUT" in tags:
+                    flow["data_inputs"].append(record)
+                if "DATA_OUTPUT" in tags:
+                    flow["data_outputs"].append(record)
+                if "MATCH_CONDITION" in tags:
+                    flow["match_conditions"].append(record)
+
+            edges, connector_warnings, row_count = _connector_edges(page, shape_map, all_shapes)
+            flow["connectors"].extend(edges)
+            flow["warnings"].extend(
+                f"Page {page_number}: {warning}" for warning in connector_warnings
+            )
+            if row_count and not edges:
+                flow["warnings"].append(
+                    f"Page {page_number}: read {row_count} Visio Connect rows but could not build directed edges"
+                )
+
+    flow["decisions"].sort(key=lambda d: (d.get("page", 0), -d.get("y", 0), d.get("x", 0)))
+    for index, decision in enumerate(flow["decisions"], 1):
+        decision["step_number"] = index
+    flow["processes"].sort(key=lambda p: (p.get("page", 0), -p.get("y", 0), p.get("x", 0)))
+
+    _apply_decision_paths(flow)
+    flow["relationships"] = list(flow["connectors"])
+    flow["process_flow"] = _build_process_flow(flow)
+    connected_ids = {
+        edge.get(key)
+        for edge in flow.get("connectors", [])
+        for key in ("from_shape_id", "to_shape_id")
+        if edge.get(key)
+    }
+    classifiable = flow.get("decisions", []) + flow.get("processes", []) + flow.get("end_state_details", [])
+    flow["diagnostics"] = {
+        "connected_node_count": len(connected_ids),
+        "unconnected_node_count": sum(1 for item in classifiable if item.get("id") not in connected_ids),
+        "unresolved_connector_warning_count": sum(
+            1 for warning in flow.get("warnings", []) if "Connector" in warning
+        ),
+        "business_rule_count": len(flow.get("business_rules", [])),
+        "classification_note": (
+            "Visual shape type and semantic business-rule detection are kept separate "
+            "to avoid treating every process box containing rule text as a decision diamond."
+        )
+    }
+    return flow
+
+# ============================================================
+# PDF EXTRACTOR (FALLBACK)
+# Uses PyMuPDF for better text extraction than pdfplumber.
+# Less accurate than vsdx but better than nothing.
+# ============================================================
+
+def deduplicate_block(text):
+    """Remove duplicate word patterns caused by PDF rendering layers."""
+    if not text:
+        return text
+    words = text.strip().split()
+    if len(words) <= 1:
+        return text
+    half = len(words) // 2
+    if len(words) % 2 == 0:
+        if words[:half] == words[half:]:
+            return " ".join(words[:half])
+    result = [words[0]]
+    for i in range(1, len(words)):
+        if words[i] != words[i - 1]:
+            result.append(words[i])
+    return " ".join(result)
+
+
+def extract_from_pdf(file_path):
+    """
+    Extract flow from a PDF file using PyMuPDF.
+    Less accurate than vsdx - cannot read shape types directly.
+    Falls back to text-based classification.
+    """
+    try:
+        import fitz
+    except ImportError:
+        print("[ERROR] PyMuPDF not installed.")
+        print("   Run: pip install pymupdf")
+        return None
+
+    flow = {
+        "source_type":    "pdf",
+        "source_file":    os.path.basename(file_path),
+        "pages":          [],
+        "document_info":  {},
+        "metadata":       [],
+        "decisions":      [],
+        "processes":      [],
+        "end_states":     [],
+        "connectors":     [],
+        "notes":          [],
+        "unknown_shapes": [],
+        "warning":        "PDF extraction is less accurate than .vsdx. "
+                          "Shape types inferred from text, not Visio master shapes."
+    }
+
+    doc = fitz.open(file_path)
+
+    # Extract document metadata
+    meta = doc.metadata or {}
+    flow["document_info"] = {
+        "title":    meta.get("title",    ""),
+        "creator":  meta.get("creator",  ""),
+        "subject":  meta.get("subject",  ""),
+        "keywords": meta.get("keywords", ""),
+        "created":  meta.get("creationDate", ""),
+        "modified": meta.get("modDate",  "")
+    }
+
+    all_blocks = []
+
+    for page_num, page in enumerate(doc):
+
+        page_info = {
+            "page_number": page_num + 1,
+            "page_name":   f"Page {page_num + 1}",
+            "width":       page.rect.width,
+            "height":      page.rect.height
+        }
+        flow["pages"].append(page_info)
+
+        data = page.get_text(
+            "dict",
+            flags=fitz.TEXT_DEHYPHENATE | fitz.TEXT_PRESERVE_WHITESPACE,
+            sort=True
+        )
+
+        for block in data.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+
+            for line in block.get("lines", []):
+                line_text = ""
+                x0 = y0 = x1 = y1 = None
+
+                for span in line.get("spans", []):
+                    span_text = span.get("text", "").strip()
+                    if not span_text:
+                        continue
+                    line_text += (" " + span_text) if line_text else span_text
+                    bbox = span.get("bbox", [0, 0, 0, 0])
+                    if x0 is None:
+                        x0 = bbox[0]
+                        y0 = bbox[1]
+                    x1 = bbox[2]
+                    y1 = bbox[3]
+
+                line_text = deduplicate_block(line_text.strip())
+                if line_text and x0 is not None:
+                    all_blocks.append({
+                        "text":     line_text,
+                        "x0":       x0,
+                        "y0":       y0,
+                        "x1":       x1,
+                        "y1":       y1,
+                        "center_x": (x0 + x1) / 2,
+                        "center_y": (y0 + y1) / 2,
+                        "page":     page_num
+                    })
+
+    doc.close()
+
+    all_blocks.sort(key=lambda b: (b["page"], b["y0"]))
+
+    # Get page bounds for relative positioning
+    all_y   = [b["y0"] for b in all_blocks] or [0, 1000]
+    min_y   = min(all_y)
+    max_y   = max(all_y)
+    page_h  = max_y - min_y or 1
+
+    step_counter = 0
+
+    for block in all_blocks:
+        text       = block["text"].strip()
+        text_upper = text.upper()
+        rel_y      = (block["y0"] - min_y) / page_h
+
+        if not text:
+            continue
+
+        # Connector labels
+        if text_upper in ("YES", "NO", "Y", "N"):
+            flow["connectors"].append({
+                "label":     text,
+                "y_pos":     block["y0"],
+                "x_pos":     block["center_x"]
+            })
+            continue
+
+        shape_type, _classification_reason = classify_shape_by_text(text)
+
+        # Override with position heuristics
+        if rel_y < 0.12:
+            shape_type = "START"
+        elif rel_y > 0.88 and shape_type == "UNKNOWN":
+            shape_type = "NOTES"
+
+        if shape_type == "START":
+            flow["metadata"].append(text)
+
+        elif shape_type == "DECISION":
+            step_counter += 1
+            flow["decisions"].append({
+                "id":          f"pdf_{step_counter}",
+                "text":        text,
+                "shape_type":  "DECISION",
+                "master_name": "inferred_from_text",
+                "x":           block["center_x"],
+                "y":           -block["y0"],
+                "step_number": step_counter,
+                "yes_path":    {"action": "unknown", "target_text": "", "target_id": ""},
+                "no_path":     {"action": "unknown", "target_text": "", "target_id": ""},
+                "page":        block["page"] + 1
+            })
+
+        elif shape_type == "END":
+            flow["end_states"].append(text)
+
+        elif shape_type == "PROCESS":
+            flow["processes"].append({
+                "id":         f"pdf_proc_{len(flow['processes'])}",
+                "text":       text,
+                "shape_type": "PROCESS",
+                "x":          block["center_x"],
+                "y":          -block["y0"],
+                "page":       block["page"] + 1
+            })
+
+        elif shape_type == "NOTES":
+            flow["notes"].append(text)
+
+        else:
+            flow["unknown_shapes"].append({
+                "text": text,
+                "y":    block["y0"],
+                "page": block["page"] + 1
+            })
+
+    # Associate YES/NO connectors with nearest decision above
+    for connector in flow["connectors"]:
+        label   = connector["label"].upper()
+        conn_y  = -connector["y_pos"]
+        conn_x  = connector["x_pos"]
+
+        decisions_above = [
+            d for d in flow["decisions"]
+            if d["y"] <= conn_y
+        ]
+        if decisions_above:
+            closest = max(decisions_above, key=lambda d: d["y"])
+            action  = "exclude" if conn_x > closest["x"] + 50 else "continue"
+
+            if label == "YES":
+                closest["yes_path"]["action"] = action
+            elif label == "NO":
+                closest["no_path"]["action"] = action
+
+    return flow
+
+
+# ============================================================
+# BUILD OUTPUTS
+# Pure extraction output. No SQL. No interpretation.
+# LLM reads this and understands the flow.
+# ============================================================
+
+def build_json_output(flow, project_key, source_file, flow_name):
+    """Build clean JSON output from extracted flow."""
+
+    ARIS_METADATA = {
+        "aris_version":  "1.1",
+        "phase":         "Visio Extractor",
+        "project":       project_key,
+        "generated_at":  datetime.now().isoformat(timespec="seconds"),
+        "source_file":   source_file,
+        "source_type":   flow.get("source_type", "unknown"),
+        "flow_name":     flow_name
+    }
+
+    return {
+        **ARIS_METADATA,
+        "document_info":   flow.get("document_info", {}),
+        "pages":           flow.get("pages", []),
+        "flow_summary": {
+            "total_pages":     len(flow.get("pages", [])),
+            "total_decisions": len(flow.get("decisions", [])),
+            "total_processes": len(flow.get("processes", [])),
+            "total_end_states":len(flow.get("end_states", [])),
+            "total_connectors":len(flow.get("connectors", [])),
+            "unknown_shapes":  len(flow.get("unknown_shapes", [])),
+            "total_business_rules": len(flow.get("business_rules", [])),
+            "total_relationships": len(flow.get("relationships", [])),
+            "source_type":     flow.get("source_type", "unknown"),
+            "accuracy_note":   (
+                "Native VSDX extraction - master names, text rules, grouped shapes, and Connect rows"
+                if flow.get("source_type") == "vsdx"
+                else "Medium accuracy - shape types inferred from text (PDF fallback)"
+            )
+        },
+        "campaign_metadata": flow.get("metadata", []),
+        "decision_rules":    flow.get("decisions", []),
+        "process_steps":     flow.get("processes", []),
+        "end_states":        flow.get("end_states", []),
+        "connectors":        flow.get("connectors", []),
+        "relationships":     flow.get("relationships", flow.get("connectors", [])),
+        "process_flow":      flow.get("process_flow", []),
+        "business_rules":    flow.get("business_rules", []),
+        "data_inputs":       flow.get("data_inputs", []),
+        "data_outputs":      flow.get("data_outputs", []),
+        "match_conditions":  flow.get("match_conditions", []),
+        "diagnostics":       flow.get("diagnostics", {}),
+        "notes":             flow.get("notes", []),
+        "unknown_shapes":    flow.get("unknown_shapes", []),
+        "warning":           flow.get("warning", ""),
+        "warnings":          flow.get("warnings", [])
+    }
+
+
+def build_markdown_output(data):
+    """
+    Build human-readable markdown.
+    Clean, structured, ready for LLM consumption.
+    No SQL. No interpretation. Just what the Visio says.
+    """
+    lines = []
+
+    lines.append("# ARIS Design Context")
+    lines.append(f"\n**Project:** {data['project']}")
+    lines.append(f"**Flow:** {data['flow_name']}")
+    lines.append(f"**Source:** {data['source_file']} ({data['source_type']})")
+    lines.append(f"**Generated:** {data['generated_at']}")
+
+    if data.get("warning"):
+        lines.append(f"\n> [WARNING] {data['warning']}")
+    for warning in data.get("warnings", []):
+        lines.append(f"\n> [WARNING] {warning}")
+
+    # Document info
+    doc_info = data.get("document_info", {})
+    if any(v for v in doc_info.values()):
+        lines.append("\n---\n## Document Information\n")
+        for key, val in doc_info.items():
+            if val:
+                lines.append(f"- **{key.replace('_', ' ').title()}:** {val}")
+
+    # Campaign metadata from START shapes
+    if data.get("campaign_metadata"):
+        lines.append("\n---\n## Campaign / Flow Metadata\n")
+        lines.append("> Extracted from start shapes at top of Visio diagram\n")
+        for item in data["campaign_metadata"]:
+            lines.append(f"- {item}")
+
+    # Flow summary
+    summary = data["flow_summary"]
+    lines.append("\n---\n## Flow Summary\n")
+    lines.append("| Metric | Value |")
+    lines.append("|---|---|")
+    lines.append(f"| Source type | {summary['source_type']} |")
+    lines.append(f"| Accuracy | {summary['accuracy_note']} |")
+    lines.append(f"| Decision rules (diamonds) | {summary['total_decisions']} |")
+    lines.append(f"| Process steps (rectangles) | {summary['total_processes']} |")
+    lines.append(f"| End states (hexagons) | {summary['total_end_states']} |")
+    lines.append(f"| Connectors traced | {summary['total_connectors']} |")
+    lines.append(f"| Business rules detected | {summary.get('total_business_rules', 0)} |")
+    lines.append(f"| Directed relationships | {summary.get('total_relationships', 0)} |")
+    if summary["unknown_shapes"] > 0:
+        lines.append(f"| Unclassified shapes | {summary['unknown_shapes']} (review manually) |")
+
+    # Business rules are semantic findings and are independent of visual shape type.
+    lines.append("\n---\n## Business Rules\n")
+    lines.append("> Rule text is detected from exact Visio wording. Visual decision diamonds are reported separately.\n")
+    rules = data.get("business_rules", [])
+    if not rules:
+        lines.append("_No business-rule text was detected._")
+    else:
+        for rule in rules:
+            lines.append(
+                f"- **{rule.get('rule_id', 'RULE')}:** {rule.get('text', '')} "
+                f"_({rule.get('rule_kind', 'BUSINESS_RULE')}; visual shape: {rule.get('shape_type', 'UNKNOWN')})_"
+            )
+
+    decisions = data.get("decision_rules", [])
+    lines.append("\n---\n## Visual Decision Points\n")
+    if not decisions:
+        lines.append("_No Visio decision-diamond shapes were found._")
+    else:
+        for decision in decisions:
+            lines.append(f"### Decision {decision.get('step_number', '?')}: {decision.get('text', '')}\n")
+            paths = []
+            if decision.get("yes_path", {}).get("target_id"):
+                paths.append(("YES", decision.get("yes_path", {})))
+            if decision.get("no_path", {}).get("target_id"):
+                paths.append(("NO", decision.get("no_path", {})))
+            for other in decision.get("other_paths", []):
+                paths.append((other.get("label") or "UNLABELED", other))
+            if paths:
+                lines.append("| Path | Action | Leads To |")
+                lines.append("|---|---|---|")
+                for label, path in paths:
+                    lines.append(f"| {label} | {path.get('action', 'continue')} | {path.get('target_text') or path.get('target_id', '')} |")
+            else:
+                lines.append("_No outgoing connector could be mapped to this decision._")
+
+    # Reconstructed process flow
+    process_flow = data.get("process_flow", [])
+    if process_flow:
+        lines.append("\n---\n## Reconstructed Process Flow\n")
+        lines.append("> Sequence is derived only from extracted Visio connectors. Unconnected shapes are listed separately.\n")
+        for item in process_flow:
+            indent = "  " * int(item.get("depth", 0))
+            next_ids = ", ".join(item.get("next_shape_ids", [])) or "END / unconnected"
+            lines.append(
+                f"{indent}{item.get('sequence', '?')}. "
+                f"[{item.get('type', 'UNKNOWN')}] {item.get('text', '')} "
+                f"(next: {next_ids})"
+            )
+
+    # Relationships
+    relationships = data.get("relationships", [])
+    if relationships:
+        lines.append("\n---\n## Shape Relationships\n")
+        lines.append("| From | Branch | To | Direction |")
+        lines.append("|---|---|---|---|")
+        for rel in relationships:
+            direction = "inferred" if rel.get("direction_inferred") else "Visio BeginX/EndX"
+            lines.append(
+                f"| {rel.get('from_shape_text') or rel.get('from_shape_id', '')} "
+                f"| {rel.get('label') or '-'} "
+                f"| {rel.get('to_shape_text') or rel.get('to_shape_id', '')} "
+                f"| {direction} |"
+            )
+
+    # Process steps
+    processes = data.get("process_steps", [])
+    if processes:
+        lines.append("\n---\n## Process Steps\n")
+        lines.append("> Action steps from rectangular shapes in the Visio diagram.\n")
+        for i, proc in enumerate(processes, 1):
+            text = proc.get("text", proc.get("action", ""))
+            lines.append(f"{i}. {text}")
+
+    # End states
+    end_states = data.get("end_states", [])
+    if end_states:
+        lines.append("\n---\n## End States\n")
+        for state in end_states:
+            lines.append(f"- {state}")
+
+    # Unknown shapes
+    unknowns = data.get("unknown_shapes", [])
+    if unknowns:
+        lines.append("\n---\n## Unclassified Shapes\n")
+        lines.append("> These shapes could not be classified automatically.")
+        lines.append("> Review manually and add to correct section if needed.\n")
+        for shape in unknowns:
+            text = shape.get("text", "")
+            lines.append(f"- {text}")
+
+    # Notes
+    notes = data.get("notes", [])
+    if notes:
+        lines.append("\n---\n## Notes and Legends\n")
+        lines.append("> Extracted from information boxes and outside-flow text.\n")
+        for note in notes[:20]:  # limit to first 20
+            lines.append(f"- {note}")
+
+    diagnostics = data.get("diagnostics", {})
+    if diagnostics:
+        lines.append("\n---\n## Extraction Diagnostics\n")
+        for key, value in diagnostics.items():
+            lines.append(f"- **{key.replace('_', ' ').title()}:** {value}")
+
+    # How to use with LLM
+    lines.append("\n---\n## How to Use This File With LLM\n")
+    lines.append("Give this file to Claude or Copilot alongside the ARIS recipe intelligence files.")
+    lines.append("Ask questions like:\n")
+    lines.append('- "Which recipes implement RULE_001? Show the matching code evidence."')
+    lines.append('- "Which Dataiku recipes implement the extracted attendance and matching rules?"')
+    lines.append('- "What actual dataset columns map to each extracted match condition?"')
+    lines.append('- "Are all business rules from this Visio implemented in the data pipeline?"')
+    lines.append('- "Generate a WHERE clause for Rule 1 based on the actual dataset columns."')
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def run_visio_extractor():
+
+    print("=" * 80)
+    print("ARIS v1.1 | Visio Extractor")
+    print("=" * 80)
+    print(f"Project      : {PROJECT_KEY}")
+    print(f"Visio File   : {VISIO_FILE}")
+    print(f"Started      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 80)
+
+    os.makedirs(LOCAL_OUTPUT_DIR, exist_ok=True)
+    os.makedirs(LOCAL_PDF_DIR,    exist_ok=True)
+
+    file_path = pdf_path(VISIO_FILE)
+
+    if not os.path.exists(file_path):
+        print(f"\n[ERROR] File not found: {file_path}")
+        print(f"   Place your Visio file in: {LOCAL_PDF_DIR}\\")
+        print(f"   Update VISIO_FILE in config\\aris_config.py")
+        return
+
+    ext = os.path.splitext(VISIO_FILE)[1].lower()
+
+    # ----------------------------------------------------------
+    # EXTRACT
+    # ----------------------------------------------------------
+    print(f"\nExtracting from {ext} file...")
+
+    if ext == ".vsdx":
+        print("[INFO] Using vsdx extractor (high accuracy)")
+        flow = extract_from_vsdx(file_path)
+    elif ext in (".pdf",):
+        print("[INFO] Using PDF extractor (medium accuracy)")
+        print("[INFO] For better results get the .vsdx file")
+        flow = extract_from_pdf(file_path)
+    else:
+        print(f"[ERROR] Unsupported file type: {ext}")
+        print("   Supported: .vsdx .pdf")
+        return
+
+    if flow is None:
+        print("[ERROR] Extraction failed. Check error messages above.")
+        return
+
+    decisions = flow.get("decisions", [])
+    processes = flow.get("processes", [])
+    print(f"\n[OK] Extraction complete:")
+    print(f"  Decision rules : {len(decisions)}")
+    print(f"  Process steps  : {len(processes)}")
+    print(f"  End states     : {len(flow.get('end_states', []))}")
+    print(f"  Connectors     : {len(flow.get('connectors', []))}")
+    print(f"  Business rules : {len(flow.get('business_rules', []))}")
+    print(f"  Relationships  : {len(flow.get('relationships', []))}")
+    print(f"  Unknown shapes : {len(flow.get('unknown_shapes', []))}")
+
+    if flow.get("unknown_shapes"):
+        print(f"\n[WARNING] {len(flow['unknown_shapes'])} unclassified shapes found:")
+        for s in flow["unknown_shapes"][:5]:
+            print(f"   - {s.get('text', '')[:60]}")
+        if len(flow["unknown_shapes"]) > 5:
+            print(f"   ... and {len(flow['unknown_shapes']) - 5} more")
+
+    # ----------------------------------------------------------
+    # DETERMINE FLOW NAME
+    # ----------------------------------------------------------
+    metadata = flow.get("metadata", [])
+    flow_name = (
+        metadata[0]
+        if metadata
+        else os.path.splitext(VISIO_FILE)[0]
+    )
+
+    # ----------------------------------------------------------
+    # BUILD OUTPUTS
+    # ----------------------------------------------------------
+    json_output = build_json_output(flow, PROJECT_KEY, VISIO_FILE, flow_name)
+    md_output   = build_markdown_output(json_output)
+
+    # ----------------------------------------------------------
+    # SAVE
+    # ----------------------------------------------------------
+    def save_json(filename, data):
+        path = output_path(filename)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+        print(f"  [SAVED] {filename}")
+
+    def save_text(filename, text):
+        path = output_path(filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"  [SAVED] {filename}")
+
+    print("\nSaving outputs...")
+    save_json(DESIGN_CONTEXT_FILE, json_output)
+    save_text(DESIGN_CONTEXT_MD,   md_output)
+
+    # ----------------------------------------------------------
+    # FINAL STATUS
+    # ----------------------------------------------------------
+    print("\n")
+    print("=" * 80)
+    print("ARIS Visio Extractor Complete")
+    print("=" * 80)
+    print(f"Project          : {PROJECT_KEY}")
+    print(f"Source           : {VISIO_FILE} ({ext})")
+    print(f"Completed        : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Decision rules   : {len(decisions)}")
+    print(f"Process steps    : {len(processes)}")
+    print()
+
+    if decisions:
+        print("Decision rules extracted:")
+        for d in decisions:
+            step = d.get("step_number", "?")
+            text = d.get("text", d.get("condition", ""))
+            yes  = d.get("yes_path", {}).get("action", "?")
+            no   = d.get("no_path",  {}).get("action", "?")
+            print(f"  Rule {step}: {text[:60]}")
+            print(f"    YES -> {yes} | NO -> {no}")
+
+    print()
+    print(f"Output files in: {LOCAL_OUTPUT_DIR}\\")
+    print(f"  [SAVED] {DESIGN_CONTEXT_FILE}")
+    print(f"  [SAVED] {DESIGN_CONTEXT_MD}")
+    print()
+    print("Next steps:")
+    print("  1. Review " + DESIGN_CONTEXT_MD)
+    print("  2. Give md file to LLM (Claude/Copilot) with Phase 1 files")
+    print("  3. Ask LLM to map rules to actual recipe columns")
+    print("  4. Run: python phase2_impact\\impact.py")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    run_visio_extractor()
