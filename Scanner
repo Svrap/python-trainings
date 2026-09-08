@@ -1,1 +1,325 @@
+# ============================================================
+# ARIS Phase 1 — Project Scanner
+# Uses official dataikuapi client library
+#
+# RUN FROM PROJECT ROOT:
+# python phase1_scanner\scanner.py
+# ============================================================
+import dataikuapi
+import json
+import os
+import sys
+import urllib3
+# Suppress SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Add project root to path so config imports work
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from config.aris_config import (
+   DATAIKU_URL,
+   DATAIKU_API_KEY,
+   PROJECT_KEY,
+   LOCAL_OUTPUT_DIR,
+   PROJECT_GRAPH_FILE,
+   RECIPE_INTELLIGENCE_FILE,
+   DATASET_REGISTRY_FILE,
+   SUMMARY_FILE,
+   STALE_AFTER_DAYS,
+   output_path
+)
+from datetime import datetime
+# ============================================================
+# MAIN SCANNER
+# ============================================================
+def run_phase1():
+   print("=" * 80)
+   print("ARIS v1.0 | Phase 1 — Project Scanner")
+   print("=" * 80)
+   print(f"Project      : {PROJECT_KEY}")
+   print(f"Dataiku URL  : {DATAIKU_URL}")
+   print(f"Started      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+   print("=" * 80)
+   # Ensure output folder exists
+   os.makedirs(LOCAL_OUTPUT_DIR, exist_ok=True)
+   # ----------------------------------------------------------
+   # CONNECT TO DATAIKU
+   # ----------------------------------------------------------
+   try:
+       client = dataikuapi.DSSClient(DATAIKU_URL, DATAIKU_API_KEY)
+       client._session.verify = False  # disable SSL cert verification
+       project = client.get_project(PROJECT_KEY)
+       print(f"\n  Connected to Dataiku successfully")
+   except Exception as e:
+       print(f"\n❌ Could not connect to Dataiku: {e}")
+       print("   Check DATAIKU_URL, DATAIKU_API_KEY, PROJECT_KEY in config/aris_config.py")
+       return
+   # Metadata added to every output file
+   ARIS_METADATA = {
+       "aris_version": "1.0",
+       "phase": "Phase 1 - Project Scanner",
+       "project": PROJECT_KEY,
+       "generated_at": datetime.now().isoformat(timespec="seconds"),
+       "stale_after_days": STALE_AFTER_DAYS
+   }
+   # Output structures
+   project_scan = {
+       **ARIS_METADATA,
+       "recipes": [],
+       "datasets": [],
+       "edges": []
+   }
+   recipe_intelligence = {
+       **ARIS_METADATA,
+       "recipes": []
+   }
+   dataset_registry = {
+       **ARIS_METADATA,
+       "datasets": {}
+   }
+   recipe_success = 0
+   recipe_errors  = 0
+   dataset_success = 0
+   dataset_errors  = 0
+   # ----------------------------------------------------------
+   # SCAN RECIPES
+   # ----------------------------------------------------------
+   print("\nFetching recipe list...")
+   try:
+       recipes = project.list_recipes()
+       total = len(recipes)
+       print(f"Found {total} recipes\n")
+   except Exception as e:
+       print(f"❌ Failed to list recipes: {e}")
+       return
+   for index, recipe_item in enumerate(recipes):
+       # recipe_item is a DSSRecipeListItem — access as dict
+       try:
+           recipe_dict = dict(recipe_item)
+           name  = recipe_dict.get("name", "")
+           rtype = recipe_dict.get("type", "unknown")
+       except Exception:
+           name  = str(recipe_item)
+           rtype = "unknown"
+       print(f"  [{index+1:>3}/{total}] {name[:55]:<55}", end="\r")
+       project_scan["recipes"].append({"name": name, "type": rtype})
+       inputs  = []
+       outputs = []
+       payload = None
+       joins   = []
+       params  = {}
+       raw_definition = {}
+       # Get recipe object and settings
+       try:
+           recipe_obj = project.get_recipe(name)
+           settings   = recipe_obj.get_settings()
+           # Inputs
+           try:
+               raw_inputs = settings.get_recipe_inputs()
+               for role, val in raw_inputs.items():
+                   items = val if isinstance(val, list) else val.get("items", [])
+                   for item in items:
+                       ds = item.get("ref") if isinstance(item, dict) else str(item)
+                       if ds:
+                           inputs.append(ds)
+                           project_scan["edges"].append({
+                               "source": ds,
+                               "target": name,
+                               "relationship": "INPUT"
+                           })
+           except Exception:
+               pass
+           # Outputs
+           try:
+               raw_outputs = settings.get_recipe_outputs()
+               for role, val in raw_outputs.items():
+                   items = val if isinstance(val, list) else val.get("items", [])
+                   for item in items:
+                       ds = item.get("ref") if isinstance(item, dict) else str(item)
+                       if ds:
+                           outputs.append(ds)
+                           project_scan["edges"].append({
+                               "source": name,
+                               "target": ds,
+                               "relationship": "OUTPUT"
+                           })
+           except Exception:
+               pass
+           # Raw definition
+           try:
+               raw_definition = settings.get_recipe_raw_definition()
+           except Exception:
+               pass
+           # Params
+           try:
+               params = settings.get_recipe_params()
+           except Exception:
+               pass
+           # Payload (SQL text or Python code)
+           try:
+               payload = settings.get_payload()
+           except Exception:
+               pass
+           # Try get_code for Python/PySpark recipes
+           if not payload:
+               try:
+                   payload = settings.get_code()
+               except Exception:
+                   pass
+           # Join configuration
+           try:
+               if hasattr(settings, "raw_joins"):
+                   joins = settings.raw_joins or []
+           except Exception:
+               pass
+           recipe_success += 1
+       except Exception as e:
+           recipe_errors += 1
+       recipe_intelligence["recipes"].append({
+           "recipe_name":    name,
+           "recipe_type":    rtype,
+           "inputs":         inputs,
+           "outputs":        outputs,
+           "params":         params,
+           "joins":          joins,
+           "payload":        payload,
+           "raw_definition": raw_definition,
+           "code":           payload if rtype in ("python", "pyspark", "r") else None
+       })
+   print(f"\n  Recipes scanned: {recipe_success} |   Errors: {recipe_errors}")
+   # ----------------------------------------------------------
+   # SCAN DATASETS
+   # ----------------------------------------------------------
+   print("\nFetching dataset list...")
+   try:
+       datasets = project.list_datasets()
+       total_ds = len(datasets)
+       print(f"Found {total_ds} datasets\n")
+   except Exception as e:
+       print(f"❌ Failed to list datasets: {e}")
+       return
+   for index, ds_item in enumerate(datasets):
+       try:
+           ds_dict = dict(ds_item)
+           name = ds_dict.get("name", "")
+       except Exception:
+           name = str(ds_item)
+       print(f"  [{index+1:>3}/{total_ds}] {name[:55]:<55}", end="\r")
+       project_scan["datasets"].append({"name": name})
+       try:
+           dataset_obj = project.get_dataset(name)
+           # Schema — columns and types
+           schema         = {}
+           columns        = []
+           column_details = []
+           try:
+               schema = dataset_obj.get_schema()
+               for col in schema.get("columns", []):
+                   col_name = col.get("name")
+                   col_type = col.get("type", "string")
+                   if col_name:
+                       columns.append(col_name)
+                       column_details.append({
+                           "name": col_name,
+                           "type": col_type
+                       })
+           except Exception:
+               pass
+           # Connection info from raw settings
+           connection = None
+           db_schema  = None
+           table      = None
+           try:
+               raw = dataset_obj.get_settings().get_raw()
+               params_raw = raw.get("params", {})
+               connection = params_raw.get("connection")
+               db_schema  = params_raw.get("schema")
+               table      = params_raw.get("table")
+           except Exception:
+               pass
+           dataset_registry["datasets"][name] = {
+               "name":           name,
+               "connection":     connection,
+               "schema":         db_schema,
+               "table":          table,
+               "column_count":   len(columns),
+               "columns":        columns,
+               "column_details": column_details,
+               "full_schema":    schema
+           }
+           dataset_success += 1
+       except Exception as e:
+           dataset_registry["datasets"][name] = {
+               "name":           name,
+               "error":          str(e),
+               "columns":        [],
+               "column_details": [],
+               "column_count":   0
+           }
+           dataset_errors += 1
+   print(f"\n  Datasets scanned: {dataset_success} |   Errors: {dataset_errors}")
+   # ----------------------------------------------------------
+   # BUILD SUMMARY
+   # ----------------------------------------------------------
+   recipe_type_counter = {}
+   for r in recipe_intelligence["recipes"]:
+       t = r.get("recipe_type", "UNKNOWN")
+       recipe_type_counter[t] = recipe_type_counter.get(t, 0) + 1
+   summary = {
+       **ARIS_METADATA,
+       "execution": {
+           "recipes_scanned":       recipe_success,
+           "recipes_with_errors":   recipe_errors,
+           "datasets_scanned":      dataset_success,
+           "datasets_with_errors":  dataset_errors,
+           "edges_captured":        len(project_scan["edges"]),
+           "recipe_type_breakdown": recipe_type_counter
+       },
+       "output_files": [
+           PROJECT_GRAPH_FILE,
+           RECIPE_INTELLIGENCE_FILE,
+           DATASET_REGISTRY_FILE,
+           SUMMARY_FILE
+       ]
+   }
+   # ----------------------------------------------------------
+   # SAVE ALL FILES TO outputs/
+   # ----------------------------------------------------------
+   def save(filename, data):
+       path = output_path(filename)
+       with open(path, "w", encoding="utf-8") as f:
+           json.dump(data, f, indent=2, default=str)
+       print(f"    {filename}")
+   print("\nSaving outputs...")
+   save(PROJECT_GRAPH_FILE,       project_scan)
+   save(RECIPE_INTELLIGENCE_FILE, recipe_intelligence)
+   save(DATASET_REGISTRY_FILE,    dataset_registry)
+   save(SUMMARY_FILE,             summary)
+   # ----------------------------------------------------------
+   # FINAL STATUS REPORT
+   # ----------------------------------------------------------
+   print("\n")
+   print("=" * 80)
+   print("ARIS Phase 1 Complete — Project Scanner")
+   print("=" * 80)
+   print(f"Project              : {PROJECT_KEY}")
+   print(f"Completed            : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+   print(f"Recipes scanned      : {recipe_success}")
+   if recipe_errors:
+       print(f"   Recipe errors     : {recipe_errors}")
+   print(f"Datasets scanned     : {dataset_success}")
+   if dataset_errors:
+       print(f"   Dataset errors    : {dataset_errors}")
+   print(f"Edges captured       : {len(project_scan['edges'])}")
+   print()
+   print("Recipe type breakdown:")
+   for rtype, count in recipe_type_counter.items():
+       print(f"  {rtype:<25} : {count}")
+   print()
+   print(f"Output files in: {LOCAL_OUTPUT_DIR}/")
+   for f in summary["output_files"]:
+       print(f"    {f}")
+   print()
+   print("Next step: Run phase2_impact\\impact.py")
+   print("=" * 80)
 
+if __name__ == "__main__":
+   run_phase1()
