@@ -1,0 +1,114 @@
+# ============================================================
+# ARIS - src/config.py
+# Reads all configuration from .env file.
+# All other ARIS files import from here.
+#
+# SETUP:
+#   1. Copy .env.example to .env
+#   2. Fill in your values in .env
+#   3. Never commit .env to Git
+# ============================================================
+
+import os
+import logging
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env from project root (one level up from src/)
+load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+log = logging.getLogger("ARIS")
+
+# ============================================================
+# DATAIKU CONNECTION
+# ============================================================
+
+DATAIKU_URL = os.getenv("DATAIKU_URL", "").rstrip("/")
+DATAIKU_API_KEY = os.getenv("DATAIKU_API_KEY", "")
+PROJECT_KEY = os.getenv("PROJECT_KEY", "")
+
+# ============================================================
+# FILE SETTINGS
+# ============================================================
+
+VISIO_FILE = os.getenv("VISIO_FILE", "")
+LOCAL_OUTPUT_DIR = os.getenv("LOCAL_OUTPUT_DIR", "outputs")
+LOCAL_PDF_DIR = os.getenv("LOCAL_PDF_DIR", "pdfs")
+LOG_DIR = os.getenv("LOG_DIR", "logs")
+STALE_AFTER_DAYS = int(os.getenv("STALE_AFTER_DAYS", "7"))
+
+# ============================================================
+# OUTPUT FILE NAMES
+# All output files are prefixed with PROJECT_KEY
+# so running against different projects never overwrites
+# ============================================================
+
+OUTPUT_PREFIX = f"{PROJECT_KEY}_ARIS_"
+
+PROJECT_GRAPH_FILE       = f"{OUTPUT_PREFIX}PROJECT_GRAPH.json"
+RECIPE_INTELLIGENCE_FILE = f"{OUTPUT_PREFIX}RECIPE_INTELLIGENCE.json"
+DATASET_REGISTRY_FILE    = f"{OUTPUT_PREFIX}DATASET_REGISTRY.json"
+SUMMARY_FILE             = f"{OUTPUT_PREFIX}SUMMARY.json"
+CODE_INTELLIGENCE_FILE   = f"{OUTPUT_PREFIX}CODE_INTELLIGENCE.json"
+CODE_INTELLIGENCE_MD     = f"{OUTPUT_PREFIX}CODE_INTELLIGENCE.md"
+COLUMN_INDEX_FILE        = f"{OUTPUT_PREFIX}COLUMN_INDEX.json"
+SQL_SUMMARY_MD           = f"{OUTPUT_PREFIX}SQL_SUMMARY.md"
+DESIGN_CONTEXT_FILE      = f"{OUTPUT_PREFIX}DESIGN_CONTEXT.json"
+DESIGN_CONTEXT_MD        = f"{OUTPUT_PREFIX}DESIGN_CONTEXT.md"
+
+# ============================================================
+# PATH HELPERS
+# ============================================================
+
+def output_path(filename: str) -> str:
+    """Full path for a file in the outputs/ folder."""
+    return os.path.join(LOCAL_OUTPUT_DIR, filename)
+
+def pdf_path(filename: str) -> str:
+    """Full path for a file in the pdfs/ folder."""
+    return os.path.join(LOCAL_PDF_DIR, filename)
+
+def log_path(filename: str) -> str:
+    """Full path for a file in the logs/ folder."""
+    return os.path.join(LOG_DIR, filename)
+
+# ============================================================
+# VALIDATION
+# Called at startup by run_aris.py
+# ============================================================
+
+def validate():
+    """
+    Validate required environment variables are set.
+    Raises EnvironmentError with clear message if anything is missing.
+    """
+    errors = []
+
+    if not DATAIKU_URL:
+        errors.append("DATAIKU_URL is not set")
+    if not DATAIKU_API_KEY:
+        errors.append("DATAIKU_API_KEY is not set")
+    if not PROJECT_KEY:
+        errors.append("PROJECT_KEY is not set")
+
+    if errors:
+        raise EnvironmentError(
+            "Missing required configuration in .env:\n"
+            + "\n".join(f"  - {e}" for e in errors)
+            + "\n\nCopy .env.example to .env and fill in your values."
+        )
+
+    # Create output directories if they don't exist
+    for folder in [LOCAL_OUTPUT_DIR, LOCAL_PDF_DIR, LOG_DIR]:
+        os.makedirs(folder, exist_ok=True)
+
+    log.info("Configuration loaded | Project: %s", PROJECT_KEY)
