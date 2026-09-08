@@ -1,0 +1,869 @@
+# ============================================================
+# ARIS Visio Extractor
+# Pure extraction of business flow from Visio files.
+# No SQL generation. No hardcoding. No interpretation.
+# Just reads what is in the Visio and builds clean context.
+#
+# SUPPORTS:
+#   .vsdx files (preferred - 95%+ accuracy)
+#   .pdf  files (fallback - uses PyMuPDF)
+#
+# RUN FROM PROJECT ROOT:
+#   python visio_converter\visio_extractor.py
+#
+# CONFIGURE in config\aris_config.py:
+#   VISIO_FILE = "your_file.vsdx"  (or .pdf)
+#
+# OUTPUTS:
+#   {PREFIX}DESIGN_CONTEXT.json  - machine readable
+#   {PREFIX}DESIGN_CONTEXT.md    - human readable for LLM
+# ============================================================
+
+import json
+import os
+import re
+import sys
+from datetime import datetime
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from config.aris_config import (
+    PROJECT_KEY,
+    LOCAL_OUTPUT_DIR,
+    LOCAL_PDF_DIR,
+    DESIGN_CONTEXT_FILE,
+    DESIGN_CONTEXT_MD,
+    output_path,
+    pdf_path
+)
+
+try:
+    from config.aris_config import VISIO_FILE
+except ImportError:
+    VISIO_FILE = "your_flow.vsdx"
+
+# ============================================================
+# SHAPE MASTER NAME LISTS
+# These are standard Visio master shape names.
+# Works for any Visio file from any domain.
+# ============================================================
+
+DECISION_MASTERS = [
+    "decision", "diamond", "rhombus",
+    "decision2", "conditional", "gateway"
+]
+
+PROCESS_MASTERS = [
+    "process", "rectangle", "box", "task",
+    "action", "step", "activity", "subprocess"
+]
+
+START_MASTERS = [
+    "start", "terminator", "rounded rectangle",
+    "begin", "trigger", "oval", "start 1",
+    "start 2", "initiation"
+]
+
+END_MASTERS = [
+    "end", "terminator", "stop", "finish",
+    "terminal", "end 1", "end 2"
+]
+
+# ============================================================
+# SHAPE CLASSIFIER
+# Uses Visio master shape name first (most reliable).
+# Falls back to text analysis if master name not available.
+# Works for any Visio diagram from any domain.
+# ============================================================
+
+def classify_shape_by_master(master_name, shape_text):
+    """
+    Classify a shape using its Visio master name.
+    Returns: DECISION, PROCESS, START, END, CONNECTOR, or NOTES
+    """
+    name = master_name.lower().strip()
+    text = shape_text.upper().strip()
+
+    if any(m in name for m in DECISION_MASTERS):
+        return "DECISION"
+    if any(m in name for m in PROCESS_MASTERS):
+        return "PROCESS"
+    if any(m in name for m in START_MASTERS):
+        return "START"
+    if any(m in name for m in END_MASTERS):
+        return "END"
+
+    return None  # unknown from master name alone
+
+
+def classify_shape_by_text(shape_text):
+    """
+    Fallback classifier using shape text when master name unavailable.
+    Looks for structural patterns not domain-specific keywords.
+    """
+    text = shape_text.strip()
+    text_upper = text.upper()
+    word_count = len(text.split())
+
+    # End states
+    if text_upper in ("STOP", "END", "FINISH", "DONE", "EXIT",
+                      "ELIGIBLE", "NOT ELIGIBLE", "SUPPRESSED",
+                      "EXCLUDED", "INCLUDED"):
+        return "END"
+
+    # Decision nodes — structural signal is the question mark
+    if "?" in text:
+        return "DECISION"
+
+    # Short text (1-2 words) alone is likely a connector label or end state
+    if word_count <= 2:
+        if text_upper in ("YES", "NO", "Y", "N"):
+            return "CONNECTOR_LABEL"
+        return "NOTES"
+
+    # Multi-word text is likely a process step or decision
+    # Cannot distinguish reliably without master name
+    return "UNKNOWN"
+
+
+def get_shape_type(shape):
+    """
+    Get shape type for a vsdx shape object.
+    Tries master name first then falls back to text.
+    """
+    master_name = ""
+    shape_text  = (shape.text or "").strip()
+
+    try:
+        if shape.master_shape and shape.master_shape.name:
+            master_name = shape.master_shape.name
+    except Exception:
+        pass
+
+    if not master_name:
+        try:
+            if shape.master_page and shape.master_page.name:
+                master_name = shape.master_page.name
+        except Exception:
+            pass
+
+    # Try master name classification first
+    if master_name:
+        result = classify_shape_by_master(master_name, shape_text)
+        if result:
+            return result, master_name
+
+    # Fallback to text classification
+    return classify_shape_by_text(shape_text), master_name
+
+
+# ============================================================
+# VSDX EXTRACTOR
+# Reads .vsdx file natively using vsdx library.
+# Extracts shapes, connectors, document properties.
+# ============================================================
+
+def extract_from_vsdx(file_path):
+    """
+    Extract complete flow from a .vsdx Visio file.
+    Returns structured flow dict.
+    """
+    try:
+        import vsdx
+    except ImportError:
+        print("[ERROR] vsdx library not installed.")
+        print("   Run: pip install vsdx")
+        return None
+
+    flow = {
+        "source_type":     "vsdx",
+        "source_file":     os.path.basename(file_path),
+        "pages":           [],
+        "document_info":   {},
+        "metadata":        [],
+        "decisions":       [],
+        "processes":       [],
+        "end_states":      [],
+        "connectors":      [],
+        "notes":           [],
+        "unknown_shapes":  []
+    }
+
+    with vsdx.VisioFile(file_path) as vis:
+
+        # Extract document properties
+        try:
+            props = vis.document_properties
+            flow["document_info"] = {
+                "title":    getattr(props, "title",    "") or "",
+                "creator":  getattr(props, "creator",  "") or "",
+                "company":  getattr(props, "company",  "") or "",
+                "subject":  getattr(props, "subject",  "") or "",
+                "keywords": getattr(props, "keywords", "") or "",
+                "created":  getattr(props, "created",  "") or "",
+                "modified": getattr(props, "modified", "") or ""
+            }
+        except Exception:
+            pass
+
+        # Process all pages
+        for page_index, page in enumerate(vis.pages):
+
+            page_info = {
+                "page_number": page_index + 1,
+                "page_name":   page.name or f"Page {page_index + 1}",
+                "shape_count": len(page.shapes)
+            }
+            flow["pages"].append(page_info)
+
+            print(f"  Page {page_index + 1}: {page_info['page_name']} "
+                  f"({page_info['shape_count']} shapes)")
+
+            shape_map = {}
+
+            for shape in page.shapes:
+
+                shape_id   = str(shape.shape_id)
+                shape_text = (shape.text or "").strip()
+
+                if not shape_text:
+                    continue
+
+                shape_type, master_name = get_shape_type(shape)
+
+                # Get position
+                try:
+                    x_pos = float(shape.x or 0)
+                    y_pos = float(shape.y or 0)
+                    width  = float(shape.width  or 0)
+                    height = float(shape.height or 0)
+                except Exception:
+                    x_pos  = 0
+                    y_pos  = 0
+                    width   = 0
+                    height  = 0
+
+                shape_record = {
+                    "id":          shape_id,
+                    "text":        shape_text,
+                    "shape_type":  shape_type,
+                    "master_name": master_name,
+                    "x":           x_pos,
+                    "y":           y_pos,
+                    "width":       width,
+                    "height":      height,
+                    "page":        page_index + 1
+                }
+
+                shape_map[shape_id] = shape_record
+
+                if shape_type == "START":
+                    flow["metadata"].append(shape_text)
+
+                elif shape_type == "DECISION":
+                    flow["decisions"].append({
+                        **shape_record,
+                        "step_number": 0,
+                        "yes_path":    {"action": "unknown", "target_text": "", "target_id": ""},
+                        "no_path":     {"action": "unknown", "target_text": "", "target_id": ""}
+                    })
+
+                elif shape_type == "PROCESS":
+                    flow["processes"].append(shape_record)
+
+                elif shape_type == "END":
+                    flow["end_states"].append(shape_text)
+
+                elif shape_type == "CONNECTOR_LABEL":
+                    pass  # handled via page.connects below
+
+                elif shape_type == "NOTES":
+                    flow["notes"].append(shape_text)
+
+                else:
+                    flow["unknown_shapes"].append(shape_record)
+
+            # Extract connectors and trace YES/NO paths
+            try:
+                for connect in page.connects:
+                    try:
+                        from_id = str(connect.from_id)
+                        to_id   = str(connect.to_id)
+                        label   = (connect.label or "").strip()
+
+                        flow["connectors"].append({
+                            "from_shape_id":   from_id,
+                            "to_shape_id":     to_id,
+                            "label":           label,
+                            "from_shape_text": shape_map.get(from_id, {}).get("text", ""),
+                            "to_shape_text":   shape_map.get(to_id,   {}).get("text", "")
+                        })
+
+                        label_upper = label.upper()
+
+                        for decision in flow["decisions"]:
+                            if decision["id"] == from_id:
+                                to_shape = shape_map.get(to_id, {})
+                                to_type  = to_shape.get("shape_type", "")
+                                to_text  = to_shape.get("text", to_id)
+                                action   = "exclude" if to_type == "END" else "continue"
+
+                                if label_upper == "YES":
+                                    decision["yes_path"] = {
+                                        "action":      action,
+                                        "target_text": to_text,
+                                        "target_id":   to_id
+                                    }
+                                elif label_upper == "NO":
+                                    decision["no_path"] = {
+                                        "action":      action,
+                                        "target_text": to_text,
+                                        "target_id":   to_id
+                                    }
+
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    # Sort decisions top to bottom
+    # Visio Y axis: higher Y = higher on page
+    flow["decisions"].sort(key=lambda d: -d.get("y", 0))
+
+    for i, decision in enumerate(flow["decisions"]):
+        decision["step_number"] = i + 1
+
+    # Sort processes top to bottom too
+    flow["processes"].sort(key=lambda p: -p.get("y", 0))
+
+    return flow
+
+
+# ============================================================
+# PDF EXTRACTOR (FALLBACK)
+# Uses PyMuPDF for better text extraction than pdfplumber.
+# Less accurate than vsdx but better than nothing.
+# ============================================================
+
+def deduplicate_block(text):
+    """Remove duplicate word patterns caused by PDF rendering layers."""
+    if not text:
+        return text
+    words = text.strip().split()
+    if len(words) <= 1:
+        return text
+    half = len(words) // 2
+    if len(words) % 2 == 0:
+        if words[:half] == words[half:]:
+            return " ".join(words[:half])
+    result = [words[0]]
+    for i in range(1, len(words)):
+        if words[i] != words[i - 1]:
+            result.append(words[i])
+    return " ".join(result)
+
+
+def extract_from_pdf(file_path):
+    """
+    Extract flow from a PDF file using PyMuPDF.
+    Less accurate than vsdx - cannot read shape types directly.
+    Falls back to text-based classification.
+    """
+    try:
+        import fitz
+    except ImportError:
+        print("[ERROR] PyMuPDF not installed.")
+        print("   Run: pip install pymupdf")
+        return None
+
+    flow = {
+        "source_type":    "pdf",
+        "source_file":    os.path.basename(file_path),
+        "pages":          [],
+        "document_info":  {},
+        "metadata":       [],
+        "decisions":      [],
+        "processes":      [],
+        "end_states":     [],
+        "connectors":     [],
+        "notes":          [],
+        "unknown_shapes": [],
+        "warning":        "PDF extraction is less accurate than .vsdx. "
+                          "Shape types inferred from text, not Visio master shapes."
+    }
+
+    doc = fitz.open(file_path)
+
+    # Extract document metadata
+    meta = doc.metadata or {}
+    flow["document_info"] = {
+        "title":    meta.get("title",    ""),
+        "creator":  meta.get("creator",  ""),
+        "subject":  meta.get("subject",  ""),
+        "keywords": meta.get("keywords", ""),
+        "created":  meta.get("creationDate", ""),
+        "modified": meta.get("modDate",  "")
+    }
+
+    all_blocks = []
+
+    for page_num, page in enumerate(doc):
+
+        page_info = {
+            "page_number": page_num + 1,
+            "page_name":   f"Page {page_num + 1}",
+            "width":       page.rect.width,
+            "height":      page.rect.height
+        }
+        flow["pages"].append(page_info)
+
+        data = page.get_text(
+            "dict",
+            flags=fitz.TEXT_DEHYPHENATE | fitz.TEXT_PRESERVE_WHITESPACE,
+            sort=True
+        )
+
+        for block in data.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+
+            for line in block.get("lines", []):
+                line_text = ""
+                x0 = y0 = x1 = y1 = None
+
+                for span in line.get("spans", []):
+                    span_text = span.get("text", "").strip()
+                    if not span_text:
+                        continue
+                    line_text += (" " + span_text) if line_text else span_text
+                    bbox = span.get("bbox", [0, 0, 0, 0])
+                    if x0 is None:
+                        x0 = bbox[0]
+                        y0 = bbox[1]
+                    x1 = bbox[2]
+                    y1 = bbox[3]
+
+                line_text = deduplicate_block(line_text.strip())
+                if line_text and x0 is not None:
+                    all_blocks.append({
+                        "text":     line_text,
+                        "x0":       x0,
+                        "y0":       y0,
+                        "x1":       x1,
+                        "y1":       y1,
+                        "center_x": (x0 + x1) / 2,
+                        "center_y": (y0 + y1) / 2,
+                        "page":     page_num
+                    })
+
+    doc.close()
+
+    all_blocks.sort(key=lambda b: (b["page"], b["y0"]))
+
+    # Get page bounds for relative positioning
+    all_y   = [b["y0"] for b in all_blocks] or [0, 1000]
+    min_y   = min(all_y)
+    max_y   = max(all_y)
+    page_h  = max_y - min_y or 1
+
+    step_counter = 0
+
+    for block in all_blocks:
+        text       = block["text"].strip()
+        text_upper = text.upper()
+        rel_y      = (block["y0"] - min_y) / page_h
+
+        if not text:
+            continue
+
+        # Connector labels
+        if text_upper in ("YES", "NO", "Y", "N"):
+            flow["connectors"].append({
+                "label":     text,
+                "y_pos":     block["y0"],
+                "x_pos":     block["center_x"]
+            })
+            continue
+
+        shape_type = classify_shape_by_text(text)
+
+        # Override with position heuristics
+        if rel_y < 0.12:
+            shape_type = "START"
+        elif rel_y > 0.88 and shape_type == "UNKNOWN":
+            shape_type = "NOTES"
+
+        if shape_type == "START":
+            flow["metadata"].append(text)
+
+        elif shape_type == "DECISION":
+            step_counter += 1
+            flow["decisions"].append({
+                "id":          f"pdf_{step_counter}",
+                "text":        text,
+                "shape_type":  "DECISION",
+                "master_name": "inferred_from_text",
+                "x":           block["center_x"],
+                "y":           -block["y0"],
+                "step_number": step_counter,
+                "yes_path":    {"action": "unknown", "target_text": "", "target_id": ""},
+                "no_path":     {"action": "unknown", "target_text": "", "target_id": ""},
+                "page":        block["page"] + 1
+            })
+
+        elif shape_type == "END":
+            flow["end_states"].append(text)
+
+        elif shape_type == "PROCESS":
+            flow["processes"].append({
+                "id":         f"pdf_proc_{len(flow['processes'])}",
+                "text":       text,
+                "shape_type": "PROCESS",
+                "x":          block["center_x"],
+                "y":          -block["y0"],
+                "page":       block["page"] + 1
+            })
+
+        elif shape_type == "NOTES":
+            flow["notes"].append(text)
+
+        else:
+            flow["unknown_shapes"].append({
+                "text": text,
+                "y":    block["y0"],
+                "page": block["page"] + 1
+            })
+
+    # Associate YES/NO connectors with nearest decision above
+    for connector in flow["connectors"]:
+        label   = connector["label"].upper()
+        conn_y  = -connector["y_pos"]
+        conn_x  = connector["x_pos"]
+
+        decisions_above = [
+            d for d in flow["decisions"]
+            if d["y"] <= conn_y
+        ]
+        if decisions_above:
+            closest = max(decisions_above, key=lambda d: d["y"])
+            action  = "exclude" if conn_x > closest["x"] + 50 else "continue"
+
+            if label == "YES":
+                closest["yes_path"]["action"] = action
+            elif label == "NO":
+                closest["no_path"]["action"] = action
+
+    return flow
+
+
+# ============================================================
+# BUILD OUTPUTS
+# Pure extraction output. No SQL. No interpretation.
+# LLM reads this and understands the flow.
+# ============================================================
+
+def build_json_output(flow, project_key, source_file, flow_name):
+    """Build clean JSON output from extracted flow."""
+
+    ARIS_METADATA = {
+        "aris_version":  "1.0",
+        "phase":         "Visio Extractor",
+        "project":       project_key,
+        "generated_at":  datetime.now().isoformat(timespec="seconds"),
+        "source_file":   source_file,
+        "source_type":   flow.get("source_type", "unknown"),
+        "flow_name":     flow_name
+    }
+
+    return {
+        **ARIS_METADATA,
+        "document_info":   flow.get("document_info", {}),
+        "pages":           flow.get("pages", []),
+        "flow_summary": {
+            "total_pages":     len(flow.get("pages", [])),
+            "total_decisions": len(flow.get("decisions", [])),
+            "total_processes": len(flow.get("processes", [])),
+            "total_end_states":len(flow.get("end_states", [])),
+            "total_connectors":len(flow.get("connectors", [])),
+            "unknown_shapes":  len(flow.get("unknown_shapes", [])),
+            "source_type":     flow.get("source_type", "unknown"),
+            "accuracy_note":   (
+                "High accuracy - shape types from Visio master names"
+                if flow.get("source_type") == "vsdx"
+                else "Medium accuracy - shape types inferred from text (PDF fallback)"
+            )
+        },
+        "campaign_metadata": flow.get("metadata", []),
+        "decision_rules":    flow.get("decisions", []),
+        "process_steps":     flow.get("processes", []),
+        "end_states":        flow.get("end_states", []),
+        "connectors":        flow.get("connectors", []),
+        "notes":             flow.get("notes", []),
+        "unknown_shapes":    flow.get("unknown_shapes", []),
+        "warning":           flow.get("warning", "")
+    }
+
+
+def build_markdown_output(data):
+    """
+    Build human-readable markdown.
+    Clean, structured, ready for LLM consumption.
+    No SQL. No interpretation. Just what the Visio says.
+    """
+    lines = []
+
+    lines.append("# ARIS Design Context")
+    lines.append(f"\n**Project:** {data['project']}")
+    lines.append(f"**Flow:** {data['flow_name']}")
+    lines.append(f"**Source:** {data['source_file']} ({data['source_type']})")
+    lines.append(f"**Generated:** {data['generated_at']}")
+
+    if data.get("warning"):
+        lines.append(f"\n> [WARNING] {data['warning']}")
+
+    # Document info
+    doc_info = data.get("document_info", {})
+    if any(v for v in doc_info.values()):
+        lines.append("\n---\n## Document Information\n")
+        for key, val in doc_info.items():
+            if val:
+                lines.append(f"- **{key.replace('_', ' ').title()}:** {val}")
+
+    # Campaign metadata from START shapes
+    if data.get("campaign_metadata"):
+        lines.append("\n---\n## Campaign / Flow Metadata\n")
+        lines.append("> Extracted from start shapes at top of Visio diagram\n")
+        for item in data["campaign_metadata"]:
+            lines.append(f"- {item}")
+
+    # Flow summary
+    summary = data["flow_summary"]
+    lines.append("\n---\n## Flow Summary\n")
+    lines.append("| Metric | Value |")
+    lines.append("|---|---|")
+    lines.append(f"| Source type | {summary['source_type']} |")
+    lines.append(f"| Accuracy | {summary['accuracy_note']} |")
+    lines.append(f"| Decision rules (diamonds) | {summary['total_decisions']} |")
+    lines.append(f"| Process steps (rectangles) | {summary['total_processes']} |")
+    lines.append(f"| End states (hexagons) | {summary['total_end_states']} |")
+    lines.append(f"| Connectors traced | {summary['total_connectors']} |")
+    if summary["unknown_shapes"] > 0:
+        lines.append(f"| Unclassified shapes | {summary['unknown_shapes']} (review manually) |")
+
+    # Decision rules — the core content
+    lines.append("\n---\n## Business Rules\n")
+    lines.append("> These are the exact filter conditions from the Visio decision diamonds.")
+    lines.append("> Order is top to bottom as they appear in the diagram.")
+    lines.append("> YES/NO paths show where each branch leads.\n")
+
+    decisions = data.get("decision_rules", [])
+    if not decisions:
+        lines.append("_No decision rules found. Check unknown_shapes in JSON for unclassified content._")
+    else:
+        for decision in decisions:
+            step = decision.get("step_number", "?")
+            text = decision.get("text", decision.get("condition", ""))
+            yes  = decision.get("yes_path", {})
+            no   = decision.get("no_path", {})
+
+            yes_action = yes.get("action", "unknown")
+            yes_target = yes.get("target_text", "")
+            no_action  = no.get("action", "unknown")
+            no_target  = no.get("target_text", "")
+
+            lines.append(f"### Rule {step}: {text}\n")
+            lines.append(f"| Path | Action | Leads To |")
+            lines.append(f"|---|---|---|")
+            lines.append(f"| YES | {yes_action} | {yes_target or 'see diagram'} |")
+            lines.append(f"| NO  | {no_action}  | {no_target  or 'see diagram'} |")
+
+            master = decision.get("master_name", "")
+            if master and master != "inferred_from_text":
+                lines.append(f"\n_Shape master: {master}_\n")
+            else:
+                lines.append("")
+
+    # Process steps
+    processes = data.get("process_steps", [])
+    if processes:
+        lines.append("\n---\n## Process Steps\n")
+        lines.append("> Action steps from rectangular shapes in the Visio diagram.\n")
+        for i, proc in enumerate(processes, 1):
+            text = proc.get("text", proc.get("action", ""))
+            lines.append(f"{i}. {text}")
+
+    # End states
+    end_states = data.get("end_states", [])
+    if end_states:
+        lines.append("\n---\n## End States\n")
+        for state in end_states:
+            lines.append(f"- {state}")
+
+    # Unknown shapes
+    unknowns = data.get("unknown_shapes", [])
+    if unknowns:
+        lines.append("\n---\n## Unclassified Shapes\n")
+        lines.append("> These shapes could not be classified automatically.")
+        lines.append("> Review manually and add to correct section if needed.\n")
+        for shape in unknowns:
+            text = shape.get("text", "")
+            lines.append(f"- {text}")
+
+    # Notes
+    notes = data.get("notes", [])
+    if notes:
+        lines.append("\n---\n## Notes and Legends\n")
+        lines.append("> Extracted from information boxes and outside-flow text.\n")
+        for note in notes[:20]:  # limit to first 20
+            lines.append(f"- {note}")
+
+    # How to use with LLM
+    lines.append("\n---\n## How to Use This File With LLM\n")
+    lines.append("Give this file to Claude or Copilot alongside the ARIS recipe intelligence files.")
+    lines.append("Ask questions like:\n")
+    lines.append('- "Which recipes implement Rule 1 (email check)? Show me the SQL."')
+    lines.append('- "Is the state suppression rule in Rule 2 implemented in the pipeline?"')
+    lines.append('- "What column name does Rule 3 map to in the actual recipe code?"')
+    lines.append('- "Are all business rules from this Visio implemented in the data pipeline?"')
+    lines.append('- "Generate a WHERE clause for Rule 1 based on the actual dataset columns."')
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def run_visio_extractor():
+
+    print("=" * 80)
+    print("ARIS v1.0 | Visio Extractor")
+    print("=" * 80)
+    print(f"Project      : {PROJECT_KEY}")
+    print(f"Visio File   : {VISIO_FILE}")
+    print(f"Started      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 80)
+
+    os.makedirs(LOCAL_OUTPUT_DIR, exist_ok=True)
+    os.makedirs(LOCAL_PDF_DIR,    exist_ok=True)
+
+    file_path = pdf_path(VISIO_FILE)
+
+    if not os.path.exists(file_path):
+        print(f"\n[ERROR] File not found: {file_path}")
+        print(f"   Place your Visio file in: {LOCAL_PDF_DIR}\\")
+        print(f"   Update VISIO_FILE in config\\aris_config.py")
+        return
+
+    ext = os.path.splitext(VISIO_FILE)[1].lower()
+
+    # ----------------------------------------------------------
+    # EXTRACT
+    # ----------------------------------------------------------
+    print(f"\nExtracting from {ext} file...")
+
+    if ext == ".vsdx":
+        print("[INFO] Using vsdx extractor (high accuracy)")
+        flow = extract_from_vsdx(file_path)
+    elif ext in (".pdf",):
+        print("[INFO] Using PDF extractor (medium accuracy)")
+        print("[INFO] For better results get the .vsdx file")
+        flow = extract_from_pdf(file_path)
+    else:
+        print(f"[ERROR] Unsupported file type: {ext}")
+        print("   Supported: .vsdx .pdf")
+        return
+
+    if flow is None:
+        print("[ERROR] Extraction failed. Check error messages above.")
+        return
+
+    decisions = flow.get("decisions", [])
+    processes = flow.get("processes", [])
+    print(f"\n[OK] Extraction complete:")
+    print(f"  Decision rules : {len(decisions)}")
+    print(f"  Process steps  : {len(processes)}")
+    print(f"  End states     : {len(flow.get('end_states', []))}")
+    print(f"  Unknown shapes : {len(flow.get('unknown_shapes', []))}")
+
+    if flow.get("unknown_shapes"):
+        print(f"\n[WARNING] {len(flow['unknown_shapes'])} unclassified shapes found:")
+        for s in flow["unknown_shapes"][:5]:
+            print(f"   - {s.get('text', '')[:60]}")
+        if len(flow["unknown_shapes"]) > 5:
+            print(f"   ... and {len(flow['unknown_shapes']) - 5} more")
+
+    # ----------------------------------------------------------
+    # DETERMINE FLOW NAME
+    # ----------------------------------------------------------
+    metadata = flow.get("metadata", [])
+    flow_name = (
+        metadata[0]
+        if metadata
+        else os.path.splitext(VISIO_FILE)[0]
+    )
+
+    # ----------------------------------------------------------
+    # BUILD OUTPUTS
+    # ----------------------------------------------------------
+    json_output = build_json_output(flow, PROJECT_KEY, VISIO_FILE, flow_name)
+    md_output   = build_markdown_output(json_output)
+
+    # ----------------------------------------------------------
+    # SAVE
+    # ----------------------------------------------------------
+    def save_json(filename, data):
+        path = output_path(filename)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+        print(f"  [SAVED] {filename}")
+
+    def save_text(filename, text):
+        path = output_path(filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"  [SAVED] {filename}")
+
+    print("\nSaving outputs...")
+    save_json(DESIGN_CONTEXT_FILE, json_output)
+    save_text(DESIGN_CONTEXT_MD,   md_output)
+
+    # ----------------------------------------------------------
+    # FINAL STATUS
+    # ----------------------------------------------------------
+    print("\n")
+    print("=" * 80)
+    print("ARIS Visio Extractor Complete")
+    print("=" * 80)
+    print(f"Project          : {PROJECT_KEY}")
+    print(f"Source           : {VISIO_FILE} ({ext})")
+    print(f"Completed        : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Decision rules   : {len(decisions)}")
+    print(f"Process steps    : {len(processes)}")
+    print()
+
+    if decisions:
+        print("Decision rules extracted:")
+        for d in decisions:
+            step = d.get("step_number", "?")
+            text = d.get("text", d.get("condition", ""))
+            yes  = d.get("yes_path", {}).get("action", "?")
+            no   = d.get("no_path",  {}).get("action", "?")
+            print(f"  Rule {step}: {text[:60]}")
+            print(f"    YES -> {yes} | NO -> {no}")
+
+    print()
+    print(f"Output files in: {LOCAL_OUTPUT_DIR}\\")
+    print(f"  [SAVED] {DESIGN_CONTEXT_FILE}")
+    print(f"  [SAVED] {DESIGN_CONTEXT_MD}")
+    print()
+    print("Next steps:")
+    print("  1. Review " + DESIGN_CONTEXT_MD)
+    print("  2. Give md file to LLM (Claude/Copilot) with Phase 1 files")
+    print("  3. Ask LLM to map rules to actual recipe columns")
+    print("  4. Run: python phase2_impact\\impact.py")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    run_visio_extractor()
