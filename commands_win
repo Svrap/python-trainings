@@ -45,3 +45,28 @@ requests
 
 # SSL warning suppression
 urllib3
+
+///
+
+# ARIS - Automated Recipe Intelligence System
+# Install: pip install -r requirements.txt
+
+# Dataiku official Python client
+dataikuapi
+
+# Environment variable management
+python-dotenv
+
+# PDF extraction - PyMuPDF (primary, handles Visio PDF text doubling)
+pymupdf
+
+# PDF extraction - fallback
+pdfplumber
+
+# HTTP and SSL
+requests
+urllib3
+
+# Visio .vsdx file parsing
+# Uncomment when .vsdx file is available
+# vsdx
