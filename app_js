@@ -52,8 +52,6 @@
     timeCost: { lostPerWeek: 1.5, recoverablePerWeek: 1.7, annualProjected: 1700 }
   };
 
-  var LOCAL_KEY = "aris_survey_stats_v1";
-
   /* ---------------------------------------------------------
      1. CSV parsing
      A real character-by-character parser, not a naive
@@ -461,66 +459,48 @@
   }
 
   /* ---------------------------------------------------------
-     7. Local persistence — remembers the last CSV you loaded,
-     on this browser, so a page reload doesn't lose it
+     7. Load the survey data from logs/survey.csv
+     Runs on page load, and again whenever "Reload data" is
+     clicked — no upload, no browser storage, just the file
+     sitting on disk next to this page.
   --------------------------------------------------------- */
-  function saveLocal(stats) {
-    try { localStorage.setItem(LOCAL_KEY, JSON.stringify(stats)); } catch (e) {}
-  }
-  function loadLocal() {
-    try {
-      var raw = localStorage.getItem(LOCAL_KEY);
-      return raw ? JSON.parse(raw) : null;
-    } catch (e) {
-      return null;
-    }
-  }
-  function clearLocal() {
-    try { localStorage.removeItem(LOCAL_KEY); } catch (e) {}
-  }
+  var CSV_PATH = "logs/survey.csv";
 
-  /* ---------------------------------------------------------
-     8. CSV upload wiring
-  --------------------------------------------------------- */
   function setStatus(msg) {
-    var el = document.getElementById("uploadStatus");
+    var el = document.getElementById("dataStatus");
     if (el) el.textContent = msg;
   }
 
-  function initUpload() {
-    var input = document.getElementById("csvFile");
-    var resetBtn = document.getElementById("resetStats");
-    if (!input) return;
-
-    input.addEventListener("change", function (e) {
-      var file = e.target.files[0];
-      if (!file) return;
-      var reader = new FileReader();
-      reader.onload = function (evt) {
-        try {
-          var rows = parseCSV(String(evt.target.result));
-          var stats = computeStats(rows);
-          renderAll(stats);
-          saveLocal(stats);
-          setStatus("Loaded " + stats.n + " responses from " + file.name + ".");
-        } catch (err) {
-          setStatus("Could not read that as the survey CSV — showing the previous numbers.");
-        }
-      };
-      reader.onerror = function () {
-        setStatus("Could not read that file.");
-      };
-      reader.readAsText(file);
-      input.value = "";
-    });
-
-    if (resetBtn) {
-      resetBtn.addEventListener("click", function () {
-        clearLocal();
+  function loadFromDisk() {
+    setStatus("Loading " + CSV_PATH + " …");
+    fetch(CSV_PATH, { cache: "no-store" })
+      .then(function (res) {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.text();
+      })
+      .then(function (text) {
+        var rows = parseCSV(text);
+        var stats = computeStats(rows);
+        renderAll(stats);
+        var now = new Date();
+        setStatus(
+          "Loaded " + stats.n + " responses from " + CSV_PATH +
+          " · " + now.toLocaleTimeString()
+        );
+      })
+      .catch(function (err) {
         renderAll(DEFAULT_STATS);
-        setStatus("Reset to the built-in numbers (n=" + DEFAULT_STATS.n + ").");
+        setStatus(
+          "Could not load " + CSV_PATH + " (" + err.message + ") — showing the built-in numbers (n=" +
+          DEFAULT_STATS.n + "). Make sure this page is served over http:// (not opened as a file://) " +
+          "and that logs/survey.csv sits next to index.html."
+        );
       });
-    }
+  }
+
+  function initReload() {
+    var btn = document.getElementById("reloadData");
+    if (btn) btn.addEventListener("click", loadFromDisk);
   }
 
   /* ---------------------------------------------------------
@@ -529,15 +509,8 @@
   document.addEventListener("DOMContentLoaded", function () {
     initReveals();
     initArchitecturePin();
-    initUpload();
-
-    var saved = loadLocal();
-    if (saved && saved.n) {
-      renderAll(saved);
-      setStatus("Showing your last uploaded data (n=" + saved.n + "). Upload a new CSV to update.");
-    } else {
-      renderAll(DEFAULT_STATS);
-      setStatus("Showing the built-in numbers (n=" + DEFAULT_STATS.n + "). Upload your survey CSV to recalculate.");
-    }
+    initReload();
+    renderAll(DEFAULT_STATS);
+    loadFromDisk();
   });
 })();
