@@ -66,10 +66,8 @@
       <div class="stat-grid" id="roleStatsGrid" style="max-width:760px; margin-left:auto; margin-right:auto"></div>
 
       <div class="upload-row">
-        <label class="upload-btn" for="csvFile">Upload survey CSV</label>
-        <input type="file" id="csvFile" accept=".csv,.txt,text/csv" style="display:none">
-        <span class="upload-status" id="uploadStatus"></span>
-        <button class="reset-link" id="resetStats" type="button">Reset to built-in numbers</button>
+        <span class="upload-status" id="dataStatus">Loading…</span>
+        <button class="reset-link" id="reloadData" type="button">Reload data</button>
       </div>
     </div>
   </section>
@@ -317,7 +315,7 @@
 
   <footer>
     <div class="footnotes">
-      <p>1. Based on an internal pulse survey of <span id="fnCount">21</span> respondents across the commercial data engineering team, September 2026 onward. Directional, not a statistically representative sample. Numbers recalculate from whatever CSV is uploaded above.</p>
+      <p>1. Based on an internal pulse survey of <span id="fnCount">21</span> respondents across the commercial data engineering team, September 2026 onward. Directional, not a statistically representative sample. Numbers recalculate from <code>logs/survey.csv</code> each time this page loads.</p>
       <p>2. Architecture shown is conceptual, reflecting known ARIS capabilities and roadmap intent — not a verified technical specification.</p>
       <p>3. Phase timeframes to be confirmed with leadership.</p>
     </div>
