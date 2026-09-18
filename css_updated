@@ -28,10 +28,8 @@ h2.head{font-size:clamp(32px,4.2vw,56px); line-height:1.08; letter-spacing:-0.02
 
 sup.fn{font-size:12px; color:var(--gray-text); cursor:default; margin-left:1px}
 
-/* ---------- CSV upload control ---------- */
+/* ---------- data status row ---------- */
 .upload-row{margin-top:22px; display:flex; flex-direction:column; align-items:center; gap:10px}
-.upload-btn{display:inline-block; font-size:13px; color:var(--gray-text); background:var(--gray-bg); border:1px solid var(--line); padding:9px 20px; border-radius:20px; cursor:pointer}
-.upload-btn:hover{color:var(--ink); border-color:var(--ink)}
 .upload-status{font-size:13px; color:var(--gray-text); max-width:480px; min-height:16px}
 .reset-link{font-size:12px; color:var(--gray-text); text-decoration:underline; cursor:pointer; background:none; border:none; font-family:inherit; padding:0}
 .reset-link:hover{color:var(--ink)}
